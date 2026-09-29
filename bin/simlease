@@ -1,0 +1,883 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SIMLEASE_VERSION="0.1.0"
+CONFIG="${SIMLEASE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/simlease/config.json}"
+STATE_DIR="${SIMLEASE_STATE_DIR:-$HOME/Library/Application Support/simlease}"
+LEASE_DIR="$STATE_DIR/leases"
+LOCK_DIR="$STATE_DIR/locks"
+CREATED_DIR="$STATE_DIR/created"
+BOOTED_DIR="$STATE_DIR/booted"
+LOCK_STALE_SECONDS="${SIMLEASE_LOCK_STALE_SECONDS:-420}"
+SIMCTL_TIMEOUT="${SIMLEASE_SIMCTL_TIMEOUT:-120}"
+BOOTSTATUS_TIMEOUT="${SIMLEASE_BOOTSTATUS_TIMEOUT:-180}"
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  simlease acquire --purpose <name> [--count N] [--wait SECONDS] [--print udid|destination]
+  simlease release <udid>... [--force]
+  simlease release --all-mine [--purpose <name>] [--force]
+  simlease reclaim-unleased --purpose <name> <udid>
+  simlease heartbeat <udid>... [--force]
+  simlease status
+  simlease gc [--dry-run] [--aggressive]
+  simlease doctor
+  simlease version
+
+Set SIMLEASE_SESSION to the same value for acquire, heartbeat and release.
+Exit codes: 0 ok, 2 usage or config error, 3 nothing acquired, 4 partial failure.
+EOF
+  exit "${1:-2}"
+}
+
+case "${1:-}" in
+  -h|--help|help) usage 0 ;;
+  -V|--version|version) printf "simlease %s\n" "$SIMLEASE_VERSION"; exit 0 ;;
+esac
+
+mkdir -p "$LEASE_DIR" "$LOCK_DIR" "$CREATED_DIR" "$BOOTED_DIR"
+
+now() { date +%s; }
+
+HELD_LOCKS=""
+
+release_held_locks() {
+  local udid
+  for udid in $HELD_LOCKS; do
+    rm -rf "$LOCK_DIR/$udid" 2>/dev/null || true
+  done
+  HELD_LOCKS=""
+}
+
+trap release_held_locks EXIT INT TERM
+
+worktree_label() {
+  git rev-parse --show-toplevel 2>/dev/null || pwd
+}
+
+session_id() {
+  if [[ -n "${SIMLEASE_SESSION:-}" ]]; then
+    printf '%s' "$SIMLEASE_SESSION"
+    return
+  fi
+  printf '%s@%s' "$(id -un)" "$(worktree_label)"
+}
+
+config_error() {
+  echo "simlease: $1" >&2
+  exit 2
+}
+
+run_timeout() {
+  local seconds="$1"
+  shift
+  "$@" &
+  local pid=$!
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( waited >= seconds )); then
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 1
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  local status=0
+  wait "$pid" || status=$?
+  return "$status"
+}
+
+simctl() {
+  run_timeout "$SIMCTL_TIMEOUT" xcrun simctl "$@"
+}
+
+jq -e . "$CONFIG" >/dev/null 2>&1 || config_error "config $CONFIG is missing or not valid JSON; copy config.example.json there or set SIMLEASE_CONFIG"
+
+pool_field() {
+  jq -r --arg purpose "$1" --arg field "$2" '.pools[$purpose][$field] // empty' "$CONFIG"
+}
+
+pool_raw() {
+  jq -r --arg purpose "$1" --arg field "$2" '(.pools[$purpose][$field] // "") | tostring' "$CONFIG"
+}
+
+guard_field() {
+  jq -r --arg field "$1" '.guards[$field] // empty' "$CONFIG"
+}
+
+require_pool() {
+  local purpose="$1" field
+  jq -e --arg purpose "$purpose" '.pools[$purpose]' "$CONFIG" >/dev/null 2>&1 || {
+    echo "simlease: unknown purpose '$purpose'; pools: $(jq -r '.pools | keys | join(", ")' "$CONFIG")" >&2
+    exit 2
+  }
+  for field in model name_prefix release max_devices; do
+    [[ -n "$(pool_raw "$purpose" "$field")" ]] || config_error "pool '$purpose' is missing '$field'"
+  done
+}
+
+DEVICES_JSON=""
+
+invalidate_devices_json() { DEVICES_JSON=""; }
+
+devices_json() {
+  if [[ -z "$DEVICES_JSON" ]]; then
+    DEVICES_JSON="$(simctl list devices available -j)" || config_error "simctl list devices failed or timed out"
+  fi
+  printf '%s' "$DEVICES_JSON"
+}
+
+all_device_names() {
+  simctl list devices -j | jq -r '.devices | to_entries[] | .value[] | .name'
+}
+
+pool_runtime() {
+  local runtime
+  runtime="$(pool_field "$1" runtime)"
+  if [[ -z "$runtime" ]]; then
+    runtime="$(simctl list runtimes -j | jq -r '
+      [.runtimes[] | select(.isAvailable and (.identifier | startswith("com.apple.CoreSimulator.SimRuntime.iOS-")))]
+      | sort_by(.version | split(".") | map(tonumber? // 0)) | last | .identifier // empty
+    ')"
+    [[ -n "$runtime" ]] || config_error "no available iOS simulator runtime; install one in Xcode or set \"runtime\" in the pool"
+  fi
+  printf '%s' "$runtime"
+}
+
+device_type_identifier() {
+  local model="$1" identifier
+  identifier="$(simctl list devicetypes -j | jq -r --arg model "$model" '
+    .devicetypes[] | select(.name == $model) | .identifier
+  ' | head -1)"
+  [[ -n "$identifier" ]] || config_error "no simulator device type matches model '$model'"
+  printf '%s' "$identifier"
+}
+
+pool_devices() {
+  local purpose="$1" model runtime identifier
+  model="$(pool_field "$purpose" model)"
+  runtime="$(pool_runtime "$purpose")"
+  identifier="$(device_type_identifier "$model")"
+  devices_json | jq -r --arg runtime "$runtime" --arg identifier "$identifier" '
+    .devices
+    | to_entries[]
+    | select(.key == $runtime)
+    | .value[]
+    | select(.isAvailable and (.deviceTypeIdentifier // "") == $identifier)
+    | [.udid, .name, .state] | @tsv
+  '
+}
+
+pool_devices_by_name() {
+  local purpose="$1" prefix
+  prefix="$(pool_field "$purpose" name_prefix)"
+  pool_devices "$purpose" | awk -F'\t' -v prefix="$prefix" '
+    index($2, prefix) == 1 {
+      print ($3 == "Booted" ? 0 : 1) "\t" $0
+    }
+  ' | LC_ALL=C sort -t$'\t' -k1,1n -k3,3 -k2,2 | cut -f2-
+}
+
+lease_file() { printf '%s/%s.json' "$LEASE_DIR" "$1"; }
+
+lease_valid() { jq -e . "$1" >/dev/null 2>&1; }
+
+drop_corrupt_lease() {
+  echo "simlease: removing unreadable lease $1" >&2
+  rm -f "$1"
+}
+
+lease_field() {
+  local udid="$1" field="$2" default="$3" file value
+  file="$(lease_file "$udid")"
+  [[ -f "$file" ]] || { printf '%s' "$default"; return; }
+  value="$(jq -r --arg field "$field" '.[$field] // empty' "$file" 2>/dev/null || true)"
+  [[ -n "$value" ]] || value="$default"
+  printf '%s' "$value"
+}
+
+lease_ttl() {
+  local ttl
+  ttl="$(pool_field "$1" lease_ttl_seconds)"
+  printf '%s' "${ttl:-1200}"
+}
+
+lease_is_live() {
+  local udid="$1" file heartbeat purpose ttl age
+  file="$(lease_file "$udid")"
+  [[ -f "$file" ]] || return 1
+  if ! lease_valid "$file"; then
+    drop_corrupt_lease "$file"
+    return 1
+  fi
+  heartbeat="$(lease_field "$udid" heartbeat_at 0)"
+  purpose="$(lease_field "$udid" purpose test)"
+  ttl="$(lease_ttl "$purpose")"
+  age=$(( $(now) - heartbeat ))
+  (( age >= 0 && age < ttl ))
+}
+
+device_in_active_build() {
+  local udid="$1" matches
+  matches="$(ps -axww -o command 2>/dev/null | grep -E '^[^ ]*/Contents/Developer/usr/bin/(xcodebuild|xctest)' || true)"
+  case "$matches" in
+    *"$udid"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+device_runs_app() {
+  local udid="$1" matches
+  matches="$(ps -axww -o command 2>/dev/null | grep -E "^[^ ]*/Devices/$udid/" | grep -Ev '^[[:space:]]*launchd_sim[[:space:]]|/PlugIns/[^/]+\.appex/' || true)"
+  [[ -n "$matches" ]]
+}
+
+device_is_busy() {
+  local udid="$1"
+  device_in_active_build "$udid" && return 0
+  device_runs_app "$udid" && return 0
+  return 1
+}
+
+simlease_booted_this() {
+  [[ -f "$BOOTED_DIR/$1" ]]
+}
+
+mark_booted_by_simlease() {
+  printf '%s\n' "$(now)" > "$BOOTED_DIR/$1" 2>/dev/null || true
+}
+
+clear_booted_marker() {
+  rm -f "$BOOTED_DIR/$1" 2>/dev/null || true
+}
+
+active_build_count() {
+  ps -axww -o command 2>/dev/null | grep -cE '^[^ ]*/Contents/Developer/usr/bin/(xcodebuild|xctest)' || true
+}
+
+write_lease() {
+  local udid="$1" name="$2" purpose="$3" was_booted="$4" file tmp
+  file="$(lease_file "$udid")"
+  tmp="$file.tmp.$$"
+  jq -n \
+    --arg udid "$udid" \
+    --arg name "$name" \
+    --arg purpose "$purpose" \
+    --arg owner "$(session_id)" \
+    --arg worktree "$(worktree_label)" \
+    --argjson pid "${PPID:-$$}" \
+    --argjson acquired "$(now)" \
+    --argjson heartbeat "$(now)" \
+    --argjson was_booted "$was_booted" \
+    '{udid:$udid,name:$name,purpose:$purpose,owner:$owner,owner_pid:$pid,worktree:$worktree,acquired_at:$acquired,heartbeat_at:$heartbeat,was_booted:$was_booted}' \
+    > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$file"
+}
+
+lock_meta() { printf '%s/%s/meta' "$LOCK_DIR" "$1"; }
+
+lock_is_stale() {
+  local udid="$1" meta pid stamp age
+  meta="$(lock_meta "$udid")"
+  [[ -f "$meta" ]] || return 0
+  pid="$(awk 'NR==1 {print $1}' "$meta" 2>/dev/null || true)"
+  stamp="$(awk 'NR==2 {print $1}' "$meta" 2>/dev/null || true)"
+  [[ "$stamp" =~ ^[0-9]+$ ]] || return 0
+  age=$(( $(now) - stamp ))
+  (( age >= LOCK_STALE_SECONDS )) && return 0
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && return 1
+  return 0
+}
+
+claim_lock() {
+  local udid="$1"
+  if ! mkdir "$LOCK_DIR/$udid" 2>/dev/null; then
+    lock_is_stale "$udid" || return 1
+    echo "simlease: reclaiming stale lock for $udid" >&2
+    rm -rf "$LOCK_DIR/$udid" 2>/dev/null || true
+    mkdir "$LOCK_DIR/$udid" 2>/dev/null || return 1
+  fi
+  printf '%s\n%s\n%s\n' "${PPID:-$$}" "$(now)" "$(session_id)" > "$(lock_meta "$udid")" 2>/dev/null || true
+  HELD_LOCKS="$HELD_LOCKS $udid"
+  return 0
+}
+
+drop_lock() {
+  local udid="$1" remaining="" held
+  rm -rf "$LOCK_DIR/$udid" 2>/dev/null || true
+  for held in $HELD_LOCKS; do
+    [[ "$held" == "$udid" ]] || remaining="$remaining $held"
+  done
+  HELD_LOCKS="$remaining"
+}
+
+device_state() {
+  invalidate_devices_json
+  devices_json | jq -r --arg udid "$1" '.devices | to_entries[] | .value[] | select(.udid == $udid) | .state'
+}
+
+boot_and_probe() {
+  local udid="$1" attempt status
+  for attempt in 1 2; do
+    if [[ "$(device_state "$udid")" != "Booted" ]]; then
+      simctl boot "$udid" >/dev/null 2>&1 || true
+      mark_booted_by_simlease "$udid"
+    fi
+    status=0
+    run_timeout "$BOOTSTATUS_TIMEOUT" xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 || status=$?
+    if (( status == 0 )) && simctl spawn "$udid" /usr/bin/true >/dev/null 2>&1; then
+      invalidate_devices_json
+      return 0
+    fi
+    echo "simlease: $udid did not answer after boot (attempt $attempt); restarting it" >&2
+    simctl shutdown "$udid" >/dev/null 2>&1 || true
+    invalidate_devices_json
+    sleep 3
+  done
+  return 1
+}
+
+booted_count() {
+  invalidate_devices_json
+  devices_json | jq '[.devices | to_entries[] | .value[] | select(.state == "Booted")] | length'
+}
+
+pool_named_devices() {
+  local purpose="$1" prefix
+  prefix="$(pool_field "$purpose" name_prefix)"
+  all_device_names | awk -v prefix="$prefix" '
+    index($0, prefix) == 1 {
+      suffix = substr($0, length(prefix) + 2)
+      if (suffix ~ /^[0-9]+$/) print suffix + 0
+    }
+  ' | LC_ALL=C sort -n -u
+}
+
+pool_name_total() {
+  pool_named_devices "$1" | wc -l | tr -d '[:space:]'
+}
+
+next_device_name() {
+  local purpose="$1" prefix used index max_devices
+  prefix="$(pool_field "$purpose" name_prefix)"
+  max_devices="$(pool_field "$purpose" max_devices)"
+  used="$(pool_named_devices "$purpose")"
+  index=1
+  while printf '%s\n' "$used" | grep -qx "$index"; do
+    index=$(( index + 1 ))
+  done
+  (( index <= max_devices )) || return 1
+  printf '%s %s' "$prefix" "$index"
+}
+
+prune_created_markers() {
+  local marker udid alive
+  alive="$(simctl list devices -j | jq -r '.devices | to_entries[] | .value[] | .udid')"
+  for marker in "$CREATED_DIR"/*; do
+    [[ -f "$marker" ]] || continue
+    udid="$(basename "$marker")"
+    printf '%s\n' "$alive" | grep -qx "$udid" || rm -f "$marker"
+  done
+}
+
+create_pool_device() {
+  local purpose="$1" name model runtime udid identifier
+  name="$(next_device_name "$purpose")" || return 1
+  model="$(pool_field "$purpose" model)"
+  runtime="$(pool_runtime "$purpose")"
+  identifier="$(device_type_identifier "$model")"
+  udid="$(simctl create "$name" "$identifier" "$runtime")" || return 1
+  printf '%s\n' "$name" > "$CREATED_DIR/$udid"
+  invalidate_devices_json
+  printf '%s\t%s\n' "$udid" "$name"
+}
+
+release_partials() {
+  local udid
+  for udid in ${1:-}; do
+    [[ -n "$udid" ]] || continue
+    release_one "$udid" true >/dev/null 2>&1 || true
+  done
+}
+
+cmd_acquire() {
+  local purpose="" count=1 wait_seconds=0 print_mode="udid"
+  while (( $# )); do
+    case "$1" in
+      --purpose) purpose="${2:-}"; shift 2 ;;
+      --count) count="${2:-}"; shift 2 ;;
+      --wait) wait_seconds="${2:-}"; shift 2 ;;
+      --print) print_mode="${2:-}"; shift 2 ;;
+      *) usage ;;
+    esac
+  done
+  [[ -n "$purpose" ]] || usage
+  [[ "$count" =~ ^[1-9][0-9]*$ ]] || config_error "--count must be a positive integer"
+  [[ "$wait_seconds" =~ ^[0-9]+$ ]] || config_error "--wait must be a non-negative integer"
+  case "$print_mode" in
+    udid|destination) ;;
+    *) config_error "--print accepts udid or destination" ;;
+  esac
+  require_pool "$purpose"
+
+  local max_devices
+  max_devices="$(pool_field "$purpose" max_devices)"
+  (( count <= max_devices )) || config_error "pool '$purpose' allows at most $max_devices device(s)"
+
+  if [[ -z "${SIMLEASE_SESSION:-}" ]]; then
+    echo "simlease: SIMLEASE_SESSION is unset; owner is '$(session_id)' — use the same value when releasing" >&2
+  fi
+
+  local max_booted
+  max_booted="$(guard_field max_booted_devices)"
+  max_booted="${max_booted:-6}"
+
+  local deadline=$(( $(now) + wait_seconds ))
+  local acquired="" acquired_count=0
+
+  while true; do
+    local udid name state was_booted
+    while IFS=$'\t' read -r udid name state; do
+      (( acquired_count < count )) || break
+      [[ -n "$udid" ]] || continue
+      lease_is_live "$udid" && continue
+      device_is_busy "$udid" && continue
+      claim_lock "$udid" || continue
+
+      state="$(device_state "$udid")"
+      was_booted=false
+      [[ "$state" != "Booted" ]] || was_booted=true
+
+      if [[ "$was_booted" == false ]] && (( $(booted_count) >= max_booted )); then
+        drop_lock "$udid"
+        echo "simlease: $max_booted devices already booted; not booting another right now" >&2
+        break
+      fi
+
+      if boot_and_probe "$udid"; then
+        if write_lease "$udid" "$name" "$purpose" "$was_booted"; then
+          acquired="$acquired $udid"
+          acquired_count=$(( acquired_count + 1 ))
+        else
+          echo "simlease: could not write the lease for $udid" >&2
+        fi
+      else
+        echo "simlease: skipping unhealthy device $name ($udid)" >&2
+      fi
+      drop_lock "$udid"
+    done < <(pool_devices_by_name "$purpose" | head -n "$max_devices")
+
+    (( acquired_count < count )) || break
+
+    local auto_create device_total pool_lock created_one
+    auto_create="$(pool_raw "$purpose" auto_create)"
+    created_one=false
+    if [[ "$auto_create" == "true" ]]; then
+      pool_lock="pool.$purpose"
+      if claim_lock "$pool_lock"; then
+        prune_created_markers
+        invalidate_devices_json
+        device_total="$(pool_name_total "$purpose")"
+        if (( device_total < max_devices )); then
+          create_pool_device "$purpose" >/dev/null && created_one=true
+        fi
+        drop_lock "$pool_lock"
+      fi
+    fi
+    if [[ "$created_one" == true ]]; then
+      continue
+    fi
+
+    if (( $(now) < deadline )); then
+      sleep 10
+      continue
+    fi
+
+    release_partials "$acquired"
+    echo "simlease: could not acquire $count device(s) for purpose '$purpose'; run 'simlease status'" >&2
+    exit 3
+  done
+
+  if [[ "$(pool_raw "$purpose" gui)" == "true" ]]; then
+    open -a Simulator >/dev/null 2>&1 || true
+  fi
+
+  local out_udid
+  for out_udid in $acquired; do
+    case "$print_mode" in
+      udid) printf '%s\n' "$out_udid" ;;
+      destination) printf 'platform=iOS Simulator,id=%s\n' "$out_udid" ;;
+    esac
+  done
+}
+
+release_one() {
+  local udid="$1" force="${2:-false}" file purpose policy was_booted owner acquired_at
+  file="$(lease_file "$udid")"
+  if [[ ! -f "$file" ]]; then
+    echo "simlease: no lease for $udid" >&2
+    return 0
+  fi
+  if ! lease_valid "$file"; then
+    drop_corrupt_lease "$file"
+    return 0
+  fi
+  owner="$(lease_field "$udid" owner unknown)"
+  if [[ "$force" != true && "$owner" != "$(session_id)" ]]; then
+    echo "simlease: $udid is leased by $owner; use --force only when that session is gone" >&2
+    return 1
+  fi
+
+  acquired_at="$(lease_field "$udid" acquired_at 0)"
+  claim_lock "$udid" || {
+    echo "simlease: $udid is being acquired right now; not releasing it" >&2
+    return 1
+  }
+  if [[ ! -f "$file" ]] || [[ "$(lease_field "$udid" acquired_at 0)" != "$acquired_at" ]]; then
+    drop_lock "$udid"
+    echo "simlease: the lease for $udid changed while releasing; leaving the new lease alone" >&2
+    return 1
+  fi
+
+  purpose="$(lease_field "$udid" purpose test)"
+  was_booted="$(lease_field "$udid" was_booted false)"
+  policy="$(pool_field "$purpose" release)"
+  rm -f "$file"
+  case "$policy" in
+    shutdown)
+      # Automated-test pools are owned by the lease for their whole lifecycle.
+      # Their configured shutdown policy must clear system services even when a
+      # previous lease did not create the booted simulator process.
+      simctl shutdown "$udid" >/dev/null 2>&1 || true
+      clear_booted_marker "$udid"
+      invalidate_devices_json
+      ;;
+    restore)
+      if simlease_booted_this "$udid"; then
+        simctl shutdown "$udid" >/dev/null 2>&1 || true
+        clear_booted_marker "$udid"
+        invalidate_devices_json
+      else
+        echo "simlease: leaving $udid booted; simlease did not boot it" >&2
+      fi
+      ;;
+  esac
+  drop_lock "$udid"
+}
+
+cmd_release() {
+  local force=false all_mine=false purpose="" udids="" rc=0 released=0
+  while (( $# )); do
+    case "$1" in
+      --force) force=true; shift ;;
+      --all-mine) all_mine=true; shift ;;
+      --purpose) purpose="${2:-}"; shift 2 ;;
+      -*) usage ;;
+      *) udids="$udids $1"; shift ;;
+    esac
+  done
+
+  if [[ "$all_mine" == true ]]; then
+    local file lease_udid owner
+    for file in "$LEASE_DIR"/*.json; do
+      [[ -e "$file" ]] || continue
+      if ! lease_valid "$file"; then
+        drop_corrupt_lease "$file"
+        continue
+      fi
+      lease_udid="$(basename "$file" .json)"
+      owner="$(lease_field "$lease_udid" owner unknown)"
+      [[ "$owner" == "$(session_id)" ]] || continue
+      if [[ -n "$purpose" && "$(lease_field "$lease_udid" purpose test)" != "$purpose" ]]; then
+        continue
+      fi
+      udids="$udids $lease_udid"
+    done
+  fi
+
+  if [[ -z "${udids// /}" ]]; then
+    if [[ "$all_mine" == true ]]; then
+      echo "simlease: no leases owned by $(session_id)" >&2
+      return 0
+    fi
+    usage
+  fi
+
+  local udid
+  for udid in $udids; do
+    if release_one "$udid" "$force"; then
+      released=$(( released + 1 ))
+    else
+      rc=4
+    fi
+  done
+  echo "simlease: released $released lease(s)" >&2
+  return "$rc"
+}
+
+cmd_reclaim_unleased() {
+  local purpose="" udid=""
+  while (( $# )); do
+    case "$1" in
+      --purpose) purpose="${2:-}"; shift 2 ;;
+      -*) usage ;;
+      *)
+        [[ -z "$udid" ]] || usage
+        udid="$1"
+        shift
+        ;;
+    esac
+  done
+  [[ -n "$purpose" && -n "$udid" ]] || usage
+  require_pool "$purpose"
+
+  pool_devices "$purpose" | awk -F$'\t' -v udid="$udid" '$1 == udid { found = 1 } END { exit found ? 0 : 1 }' || {
+    echo "simlease: $udid is not in pool '$purpose'" >&2
+    exit 2
+  }
+  lease_is_live "$udid" && {
+    echo "simlease: $udid has a live lease; release it through its owner" >&2
+    exit 4
+  }
+  simlease_booted_this "$udid" || {
+    echo "simlease: $udid was not booted by simlease; refusing to reclaim it" >&2
+    exit 4
+  }
+  device_in_active_build "$udid" && {
+    echo "simlease: $udid has an active Xcode build; refusing to reclaim it" >&2
+    exit 4
+  }
+  claim_lock "$udid" || {
+    echo "simlease: could not lock $udid for reclaim" >&2
+    exit 4
+  }
+  if lease_is_live "$udid"; then
+    drop_lock "$udid"
+    echo "simlease: $udid acquired a lease while reclaiming; leaving it alone" >&2
+    exit 4
+  fi
+  simctl shutdown "$udid" >/dev/null 2>&1 || true
+  clear_booted_marker "$udid"
+  invalidate_devices_json
+  drop_lock "$udid"
+  echo "simlease: reclaimed unleased $purpose device $udid" >&2
+}
+
+cmd_heartbeat() {
+  local force=false udids="" rc=0
+  while (( $# )); do
+    case "$1" in
+      --force) force=true; shift ;;
+      -*) usage ;;
+      *) udids="$udids $1"; shift ;;
+    esac
+  done
+  [[ -n "${udids// /}" ]] || usage
+
+  local udid file owner tmp
+  for udid in $udids; do
+    file="$(lease_file "$udid")"
+    if [[ ! -f "$file" ]] || ! lease_valid "$file"; then
+      echo "simlease: no readable lease for $udid" >&2
+      rc=4
+      continue
+    fi
+    owner="$(lease_field "$udid" owner unknown)"
+    if [[ "$force" != true && "$owner" != "$(session_id)" ]]; then
+      echo "simlease: $udid is leased by $owner; refusing to extend that lease" >&2
+      rc=4
+      continue
+    fi
+    tmp="$file.tmp.$$"
+    if jq --argjson heartbeat "$(now)" '.heartbeat_at = $heartbeat' "$file" > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$file"
+    else
+      rm -f "$tmp"
+      echo "simlease: could not update the heartbeat for $udid" >&2
+      rc=4
+    fi
+  done
+  return "$rc"
+}
+
+cmd_status() {
+  printf '%-38s %-16s %-8s %-28s %s\n' UDID NAME PURPOSE OWNER AGE
+  local file udid name purpose owner heartbeat age ttl mark
+  for file in "$LEASE_DIR"/*.json; do
+    [[ -e "$file" ]] || continue
+    if ! lease_valid "$file"; then
+      drop_corrupt_lease "$file"
+      continue
+    fi
+    udid="$(basename "$file" .json)"
+    name="$(lease_field "$udid" name '?')"
+    purpose="$(lease_field "$udid" purpose '?')"
+    owner="$(lease_field "$udid" owner '?')"
+    heartbeat="$(lease_field "$udid" heartbeat_at 0)"
+    age=$(( $(now) - heartbeat ))
+    ttl="$(lease_ttl "$purpose")"
+    mark="live"
+    (( age < ttl )) || mark="stale"
+    printf '%-38s %-16s %-8s %-28s %ss (%s)\n' "$udid" "$name" "$purpose" "$owner" "$age" "$mark"
+  done
+
+  local locks="" dir
+  for dir in "$LOCK_DIR"/*; do
+    [[ -d "$dir" ]] || continue
+    locks="$locks $(basename "$dir")"
+  done
+  [[ -z "${locks// /}" ]] || echo "locks held:$locks"
+
+  printf '\nbooted devices: %s, active xcodebuild/xctest: %s, load: %s\n' \
+    "$(booted_count)" \
+    "$(active_build_count)" \
+    "$(sysctl -n vm.loadavg | tr -d '{}')"
+}
+
+cmd_gc() {
+  local dry_run=false aggressive=false
+  while (( $# )); do
+    case "$1" in
+      --dry-run) dry_run=true; shift ;;
+      --aggressive) aggressive=true; shift ;;
+      *) usage ;;
+    esac
+  done
+
+  local file udid purpose policy acquired_at
+  for file in "$LEASE_DIR"/*.json; do
+    [[ -e "$file" ]] || continue
+    if ! lease_valid "$file"; then
+      if [[ "$dry_run" == true ]]; then
+        echo "simlease: would remove unreadable lease $file"
+      else
+        drop_corrupt_lease "$file"
+      fi
+      continue
+    fi
+    udid="$(basename "$file" .json)"
+    lease_is_live "$udid" && continue
+    device_is_busy "$udid" && continue
+
+    purpose="$(lease_field "$udid" purpose test)"
+    policy="$(pool_field "$purpose" release)"
+    if [[ "$policy" != "shutdown" && "$aggressive" != true ]]; then
+      echo "simlease: keeping the stale $purpose lease for $udid; a human may still be watching it (use --aggressive)" >&2
+      continue
+    fi
+
+    if [[ "$dry_run" == true ]]; then
+      echo "simlease: would reclaim the stale lease for $udid ($purpose)"
+      continue
+    fi
+
+    acquired_at="$(lease_field "$udid" acquired_at 0)"
+    claim_lock "$udid" || { echo "simlease: $udid is busy; skipping it" >&2; continue; }
+    if lease_is_live "$udid" || [[ "$(lease_field "$udid" acquired_at 0)" != "$acquired_at" ]]; then
+      drop_lock "$udid"
+      continue
+    fi
+    drop_lock "$udid"
+    echo "simlease: reclaiming the stale lease for $udid ($purpose)"
+    release_one "$udid" true || true
+  done
+
+  local dir lock_udid
+  for dir in "$LOCK_DIR"/*; do
+    [[ -d "$dir" ]] || continue
+    lock_udid="$(basename "$dir")"
+    lock_is_stale "$lock_udid" || continue
+    if [[ "$dry_run" == true ]]; then
+      echo "simlease: would drop the stale lock for $lock_udid"
+    else
+      echo "simlease: dropping the stale lock for $lock_udid"
+      rm -rf "$dir" 2>/dev/null || true
+    fi
+  done
+
+  local sweep_enabled sweep_pool sweep_udid sweep_name sweep_state
+  sweep_enabled="$(guard_field sweep_unleased_booted)"
+  if [[ "$sweep_enabled" != "false" ]]; then
+    for sweep_pool in $(jq -r '.pools | to_entries[] | select(.value.release == "shutdown") | .key' "$CONFIG"); do
+      while IFS=$'\t' read -r sweep_udid sweep_name sweep_state; do
+        [[ -n "$sweep_udid" ]] || continue
+        if [[ "$sweep_state" != "Booted" ]]; then
+          clear_booted_marker "$sweep_udid"
+          continue
+        fi
+        [[ -f "$(lease_file "$sweep_udid")" ]] && continue
+        simlease_booted_this "$sweep_udid" || continue
+        device_is_busy "$sweep_udid" && continue
+        if [[ "$dry_run" == true ]]; then
+          echo "simlease: would shut down unleased $sweep_name ($sweep_udid)"
+          continue
+        fi
+        claim_lock "$sweep_udid" || continue
+        if [[ -f "$(lease_file "$sweep_udid")" ]] || device_is_busy "$sweep_udid"; then
+          drop_lock "$sweep_udid"
+          continue
+        fi
+        echo "simlease: shutting down unleased $sweep_name ($sweep_udid)"
+        simctl shutdown "$sweep_udid" >/dev/null 2>&1 || true
+        clear_booted_marker "$sweep_udid"
+        invalidate_devices_json
+        drop_lock "$sweep_udid"
+      done < <(pool_devices_by_name "$sweep_pool")
+    done
+  fi
+
+  local ttl_hours created_file created_udid
+  if [[ "$dry_run" != true ]]; then
+    prune_created_markers
+  fi
+  ttl_hours="$(guard_field auto_created_device_ttl_hours)"
+  ttl_hours="${ttl_hours:-24}"
+  for created_file in "$CREATED_DIR"/*; do
+    [[ -f "$created_file" ]] || continue
+    created_udid="$(basename "$created_file")"
+    [[ -f "$(lease_file "$created_udid")" ]] && continue
+    device_is_busy "$created_udid" && continue
+    [[ -n "$(find "$created_file" -mmin +$(( ttl_hours * 60 )) 2>/dev/null)" ]] || continue
+    if [[ "$dry_run" == true ]]; then
+      echo "simlease: would delete auto-created device $created_udid (older than ${ttl_hours}h, unleased)"
+      continue
+    fi
+    echo "simlease: deleting auto-created device $created_udid (older than ${ttl_hours}h, unleased)"
+    simctl shutdown "$created_udid" >/dev/null 2>&1 || true
+    simctl delete "$created_udid" >/dev/null 2>&1 || true
+    rm -f "$created_file"
+    invalidate_devices_json
+  done
+}
+
+cmd_doctor() {
+  printf 'config: %s\n' "$CONFIG"
+  jq -r '.pools | to_entries[] | "pool \(.key): model=\(.value.model) runtime=\(.value.runtime // "latest iOS") prefix=\(.value.name_prefix) release=\(.value.release) max_devices=\(.value.max_devices)"' "$CONFIG"
+  local purpose
+  for purpose in $(jq -r '.pools | keys[]' "$CONFIG"); do
+    require_pool "$purpose"
+    printf -- '--- %s\n' "$purpose"
+    pool_devices_by_name "$purpose" | awk -F'\t' '{ printf "  %s  %-16s %s\n", $1, $2, $3 }'
+  done
+  printf 'state: %s\n' "$STATE_DIR"
+  cmd_status
+}
+
+command="${1:-}"
+[[ -n "$command" ]] || usage
+shift || true
+
+case "$command" in
+  acquire) cmd_acquire "$@" ;;
+  release) cmd_release "$@" ;;
+  reclaim-unleased) cmd_reclaim_unleased "$@" ;;
+  heartbeat) cmd_heartbeat "$@" ;;
+  status) cmd_status "$@" ;;
+  gc) cmd_gc "$@" ;;
+  doctor) cmd_doctor "$@" ;;
+  *) usage ;;
+esac

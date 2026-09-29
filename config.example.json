@@ -1,0 +1,27 @@
+{
+  "pools": {
+    "test": {
+      "model": "iPhone SE (3rd generation)",
+      "name_prefix": "iPhone SE",
+      "max_devices": 4,
+      "auto_create": true,
+      "release": "shutdown",
+      "gui": false,
+      "lease_ttl_seconds": 1200
+    },
+    "visual": {
+      "model": "iPhone 17 Pro",
+      "name_prefix": "iPhone 17 Pro",
+      "max_devices": 1,
+      "auto_create": true,
+      "release": "keep-booted",
+      "gui": true,
+      "lease_ttl_seconds": 7200
+    }
+  },
+  "guards": {
+    "max_booted_devices": 6,
+    "auto_created_device_ttl_hours": 24,
+    "sweep_unleased_booted": true
+  }
+}

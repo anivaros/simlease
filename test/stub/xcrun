@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Fake `xcrun simctl` backed by $STUB_DIR/devices.tsv:
+# udid <TAB> name <TAB> device type identifier <TAB> runtime <TAB> state
+set -euo pipefail
+
+db="$STUB_DIR/devices.tsv"
+touch "$db"
+printf '%s\n' "$*" >> "$STUB_DIR/calls.log"
+
+[[ "${1:-}" == simctl ]] || { echo "stub xcrun: only simctl is supported" >&2; exit 64; }
+shift
+
+type_id() {
+  case "$1" in
+    "iPhone SE (3rd generation)") echo com.apple.CoreSimulator.SimDeviceType.iPhone-SE-3rd-generation ;;
+    "iPhone 17 Pro") echo com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro ;;
+    "iPhone 17 Pro Max") echo com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro-Max ;;
+    *) echo "$1" ;;
+  esac
+}
+
+set_state() {
+  awk -F'\t' -v OFS='\t' -v udid="$1" -v state="$2" '$1 == udid { $5 = state } { print }' "$db" > "$db.tmp"
+  mv "$db.tmp" "$db"
+}
+
+has_device() { awk -F'\t' -v udid="$1" '$1 == udid { found = 1 } END { exit found ? 0 : 1 }' "$db"; }
+
+case "$1 ${2:-}" in
+  "list devices")
+    jq -R -s '
+      split("\n") | map(select(length > 0) | split("\t"))
+      | reduce .[] as $d ({}; .[$d[3]] += [{udid: $d[0], name: $d[1], deviceTypeIdentifier: $d[2], state: $d[4], isAvailable: true}])
+      | {devices: .}
+    ' "$db"
+    ;;
+  "list devicetypes")
+    jq -n '{devicetypes: [
+      {name: "iPhone SE (3rd generation)", identifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-SE-3rd-generation"},
+      {name: "iPhone 17 Pro", identifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro"},
+      {name: "iPhone 17 Pro Max", identifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro-Max"}
+    ]}'
+    ;;
+  "list runtimes")
+    jq -n '{runtimes: [
+      {identifier: "com.apple.CoreSimulator.SimRuntime.iOS-26-4", version: "26.4", isAvailable: true},
+      {identifier: "com.apple.CoreSimulator.SimRuntime.iOS-27-1", version: "27.1", isAvailable: true},
+      {identifier: "com.apple.CoreSimulator.SimRuntime.iOS-27-0", version: "27.0", isAvailable: true},
+      {identifier: "com.apple.CoreSimulator.SimRuntime.watchOS-12-0", version: "12.0", isAvailable: true}
+    ]}'
+    ;;
+  boot\ *)
+    has_device "$2" || exit 1
+    set_state "$2" Booted
+    ;;
+  bootstatus\ *)
+    [[ -z "${STUB_BOOTSTATUS_HANG:-}" ]] || exec sleep 3600
+    ;;
+  spawn\ *)
+    [[ "${STUB_SPAWN_FAIL:-}" != "$2" ]]
+    ;;
+  shutdown\ *)
+    set_state "$2" Shutdown
+    ;;
+  create\ *)
+    udid="$(uuidgen)"
+    printf '%s\t%s\t%s\t%s\tShutdown\n' "$udid" "$2" "$(type_id "$3")" "$4" >> "$db"
+    echo "$udid"
+    ;;
+  delete\ *)
+    awk -F'\t' -v udid="$2" '$1 != udid' "$db" > "$db.tmp"
+    mv "$db.tmp" "$db"
+    ;;
+  *)
+    echo "stub xcrun: unsupported simctl $*" >&2
+    exit 64
+    ;;
+esac

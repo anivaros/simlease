@@ -1,0 +1,19 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax
+        run: |
+          bash -n bin/simlease install.sh test/run.sh test/stub/xcrun
+          /bin/bash -n bin/simlease
+      - name: Tests (bash on PATH)
+        run: test/run.sh
+      - name: Tests (macOS /bin/bash 3.2)
+        run: test/run.sh /bin/bash
