@@ -6,7 +6,7 @@ When a few Claude Code / Codex sessions run tests in parallel, each one tends to
 
 - **Pools by purpose.** `test` = iPhone SE for automated tests, `visual` = iPhone 17 Pro for looking at the app. The pool, not the agent, decides the device type, runtime and limits.
 - **Exclusive leases.** A device with a live lease, a running `xcodebuild`/`xctest` that targets it, or an app process running on it is never handed out.
-- **Healthy devices only.** `acquire` boots the device, waits for `bootstatus`, probes it with `spawn`, and restarts it once if it does not answer.
+- **Healthy devices only.** `acquire` boots the device, waits for `bootstatus`, probes it with `simctl listapps`, and restarts it once if it does not answer.
 - **Cleanup that respects people.** `gc` shuts down only what simlease booted and nobody holds. A simulator you started from the Xcode GUI is left alone.
 - **Plain files.** One bash script, `jq`, and a state directory. No daemon; a launchd agent runs `gc` every 15 minutes.
 
@@ -100,7 +100,7 @@ Pool keys:
 
 - `model` (required): exact device type name from `xcrun simctl list devicetypes`. Matching is by device type identifier, so `iPhone 17 Pro` never returns an `iPhone 17 Pro Max`.
 - `runtime`: runtime identifier such as `com.apple.CoreSimulator.SimRuntime.iOS-27-0`. Defaults to the newest available iOS runtime.
-- `name_prefix` (required): only devices whose name starts with it belong to the pool; auto-created devices are named `<prefix> 1`, `<prefix> 2`, …
+- `name_prefix` (required): only devices named `<prefix> <N>` belong to the pool, so Xcode's default `iPhone SE (3rd generation)` stays out of an `iPhone SE` pool. Auto-created devices get the next free `<prefix> <N>`.
 - `max_devices` (required): pool size, including auto-created devices.
 - `auto_create`: create a new device when every pool device is taken.
 - `release` (required): `shutdown` shuts the device down on release, `restore` shuts it down only if simlease booted it, `keep-booted` leaves it running (for a device a human is looking at).

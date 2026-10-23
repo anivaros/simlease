@@ -175,8 +175,9 @@ pool_devices() {
 pool_devices_by_name() {
   local purpose="$1" prefix
   prefix="$(pool_field "$purpose" name_prefix)"
+  # Only "<prefix> <N>" belongs to the pool: Xcode's default devices share the model and runtime.
   pool_devices "$purpose" | awk -F'\t' -v prefix="$prefix" '
-    index($2, prefix) == 1 {
+    index($2, prefix " ") == 1 && substr($2, length(prefix) + 2) ~ /^[0-9]+$/ {
       print ($3 == "Booted" ? 0 : 1) "\t" $0
     }
   ' | LC_ALL=C sort -t$'\t' -k1,1n -k3,3 -k2,2 | cut -f2-
@@ -329,7 +330,8 @@ boot_and_probe() {
     fi
     status=0
     run_timeout "$BOOTSTATUS_TIMEOUT" xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 || status=$?
-    if (( status == 0 )) && simctl spawn "$udid" /usr/bin/true >/dev/null 2>&1; then
+    # Xcode 27.2 `simctl spawn` rejects every program; listapps also needs a live launchd_sim and installd.
+    if (( status == 0 )) && simctl listapps "$udid" >/dev/null 2>&1; then
       invalidate_devices_json
       return 0
     fi
@@ -350,7 +352,7 @@ pool_named_devices() {
   local purpose="$1" prefix
   prefix="$(pool_field "$purpose" name_prefix)"
   all_device_names | awk -v prefix="$prefix" '
-    index($0, prefix) == 1 {
+    index($0, prefix " ") == 1 {
       suffix = substr($0, length(prefix) + 2)
       if (suffix ~ /^[0-9]+$/) print suffix + 0
     }
@@ -635,7 +637,7 @@ cmd_reclaim_unleased() {
   [[ -n "$purpose" && -n "$udid" ]] || usage
   require_pool "$purpose"
 
-  pool_devices "$purpose" | awk -F$'\t' -v udid="$udid" '$1 == udid { found = 1 } END { exit found ? 0 : 1 }' || {
+  pool_devices_by_name "$purpose" | awk -F$'\t' -v udid="$udid" '$1 == udid { found = 1 } END { exit found ? 0 : 1 }' || {
     echo "simlease: $udid is not in pool '$purpose'" >&2
     exit 2
   }

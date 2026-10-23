@@ -25,7 +25,7 @@ setup() {
   printf '#!/bin/sh\nexit 0\n' > "$WORK/bin/open"
   chmod +x "$WORK/bin/xcrun" "$WORK/bin/open"
   export PATH="$WORK/bin:$ORIGINAL_PATH"
-  unset STUB_BOOTSTATUS_HANG STUB_SPAWN_FAIL
+  unset STUB_BOOTSTATUS_HANG STUB_PROBE_FAIL
   jq '.pools.test.auto_create = false | .pools.test.max_devices = 3' "$ROOT/config.example.json" > "$SIMLEASE_CONFIG"
   printf '%s\n' \
     "SE-1	iPhone SE 1	$SE	$LATEST	Shutdown" \
@@ -33,6 +33,8 @@ setup() {
     "SE-OLD	iPhone SE 9	$SE	$OLDER	Shutdown" \
     "PROMAX-1	iPhone 17 Pro Max	$PRO_MAX	$LATEST	Shutdown" \
     "PRO-1	iPhone 17 Pro 1	$PRO	$LATEST	Shutdown" \
+    "SE-XCODE	iPhone SE (3rd generation)	$SE	$LATEST	Shutdown" \
+    "SE-COPY	iPhone SE 1 copy	$SE	$LATEST	Shutdown" \
     > "$STUB_DIR/devices.tsv"
 }
 
@@ -109,6 +111,26 @@ test_acquire_prefers_already_booted_device() {
 
 test_visual_pool_matches_exact_model() {
   expect "17 Pro, never Pro Max" [ "$(sl acquire --purpose visual)" = PRO-1 ]
+}
+
+test_pool_takes_only_prefix_and_number_names() {
+  set_state SE-XCODE Booted
+  set_state SE-COPY Booted
+  sl acquire --purpose test --count 2 >/dev/null
+  expect "Xcode default device not leased" [ ! -f "$(lease SE-XCODE)" ]
+  expect "copied device not leased" [ ! -f "$(lease SE-COPY)" ]
+  expect "SE 1 leased" [ -f "$(lease SE-1)" ]
+  expect "SE 2 leased" [ -f "$(lease SE-2)" ]
+}
+
+test_reclaim_unleased_refuses_device_outside_pool() {
+  set_state SE-XCODE Booted
+  mkdir -p "$SIMLEASE_STATE_DIR/booted"
+  echo 1 > "$SIMLEASE_STATE_DIR/booted/SE-XCODE"
+  local rc=0
+  sl reclaim-unleased --purpose test SE-XCODE >/dev/null 2>&1 || rc=$?
+  expect "exit 2" [ "$rc" = 2 ]
+  expect "Xcode default device still booted" [ "$(state_of SE-XCODE)" = Booted ]
 }
 
 test_count_and_destination_output() {
@@ -236,6 +258,7 @@ test_stale_lock_is_reclaimed() {
 
 test_auto_create_adds_device_on_latest_runtime() {
   jq '.pools.test.auto_create = true | .pools.test.max_devices = 4' "$SIMLEASE_CONFIG" > "$WORK/t" && mv "$WORK/t" "$SIMLEASE_CONFIG"
+  printf '%s\n' "SE-X3	iPhone SEx3	$SE	$LATEST	Shutdown" >> "$STUB_DIR/devices.tsv"
   sl acquire --purpose test --count 3 >/dev/null
   local created
   created="$(awk -F'\t' '$2 == "iPhone SE 3" { print $4 }' "$STUB_DIR/devices.tsv")"
@@ -253,7 +276,7 @@ test_max_booted_guard_stops_booting() {
 }
 
 test_unhealthy_device_is_skipped() {
-  export STUB_SPAWN_FAIL=SE-1
+  export STUB_PROBE_FAIL=SE-1
   expect "next healthy device" [ "$(sl acquire --purpose test)" = SE-2 ]
   expect "no lease on unhealthy one" [ ! -f "$(lease SE-1)" ]
 }

@@ -57,7 +57,11 @@ case "$1 ${2:-}" in
     [[ -z "${STUB_BOOTSTATUS_HANG:-}" ]] || exec sleep 3600
     ;;
   spawn\ *)
-    [[ "${STUB_SPAWN_FAIL:-}" != "$2" ]]
+    echo "Invalid or missing Program/ProgramArguments" >&2
+    exit 111
+    ;;
+  listapps\ *)
+    [[ "${STUB_PROBE_FAIL:-}" != "$2" ]]
     ;;
   shutdown\ *)
     set_state "$2" Shutdown
