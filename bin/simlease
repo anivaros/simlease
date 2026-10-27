@@ -19,6 +19,8 @@ usage:
   simlease release <udid>... [--force]
   simlease release --all-mine [--purpose <name>] [--force]
   simlease reclaim-unleased --purpose <name> <udid>
+  simlease resume <udid>
+  simlease reboot <udid>
   simlease heartbeat <udid>... [--force]
   simlease status
   simlease gc [--dry-run] [--aggressive]
@@ -50,7 +52,19 @@ release_held_locks() {
   HELD_LOCKS=""
 }
 
-trap release_held_locks EXIT INT TERM
+RUN_TIMEOUT_PID=""
+stop_for_signal() {
+  local code="$1"
+  if [[ -n "$RUN_TIMEOUT_PID" ]]; then
+    kill -TERM "$RUN_TIMEOUT_PID" 2>/dev/null || true
+    kill -KILL "$RUN_TIMEOUT_PID" 2>/dev/null || true
+    wait "$RUN_TIMEOUT_PID" 2>/dev/null || true
+  fi
+  exit "$code"
+}
+trap release_held_locks EXIT
+trap 'stop_for_signal 130' INT
+trap 'stop_for_signal 143' TERM
 
 worktree_label() {
   git rev-parse --show-toplevel 2>/dev/null || pwd
@@ -74,6 +88,7 @@ run_timeout() {
   shift
   "$@" &
   local pid=$!
+  RUN_TIMEOUT_PID="$pid"
   local waited=0
   while kill -0 "$pid" 2>/dev/null; do
     if (( waited >= seconds )); then
@@ -81,6 +96,7 @@ run_timeout() {
       sleep 1
       kill -KILL "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
+      RUN_TIMEOUT_PID=""
       return 124
     fi
     sleep 1
@@ -88,6 +104,7 @@ run_timeout() {
   done
   local status=0
   wait "$pid" || status=$?
+  RUN_TIMEOUT_PID=""
   return "$status"
 }
 
@@ -282,11 +299,18 @@ write_lease() {
 lock_meta() { printf '%s/%s/meta' "$LOCK_DIR" "$1"; }
 
 lock_is_stale() {
-  local udid="$1" meta pid stamp age
+  local udid="$1" meta pid stamp age kind
   meta="$(lock_meta "$udid")"
-  [[ -f "$meta" ]] || return 0
+  if [[ ! -f "$meta" ]]; then
+    [[ -n "$(find "$LOCK_DIR/$udid" -maxdepth 0 -mmin +1 -print 2>/dev/null)" ]]
+    return
+  fi
   pid="$(awk 'NR==1 {print $1}' "$meta" 2>/dev/null || true)"
   stamp="$(awk 'NR==2 {print $1}' "$meta" 2>/dev/null || true)"
+  kind="$(awk 'NR==4 {print $1}' "$meta" 2>/dev/null || true)"
+  if [[ "$kind" == lifecycle && "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    return 1
+  fi
   [[ "$stamp" =~ ^[0-9]+$ ]] || return 0
   age=$(( $(now) - stamp ))
   (( age >= LOCK_STALE_SECONDS )) && return 0
@@ -294,26 +318,89 @@ lock_is_stale() {
   return 0
 }
 
+reclaim_stale_lock() {
+  local udid="$1" guard=".reclaim.$1" rc=1
+  # shortcut: a SIGKILL can leave this guard behind; inspect and remove it after confirming its owner is gone.
+  mkdir "$LOCK_DIR/$guard" 2>/dev/null || return 1
+  HELD_LOCKS="$HELD_LOCKS $guard"
+  if [[ -d "$LOCK_DIR/$udid" ]] && lock_is_stale "$udid"; then
+    if rm -rf "$LOCK_DIR/$udid"; then rc=0; fi
+  fi
+  drop_lock "$guard"
+  return "$rc"
+}
+
 claim_lock() {
-  local udid="$1"
+  local udid="$1" kind="${2:-}" pid="${PPID:-$$}"
   if ! mkdir "$LOCK_DIR/$udid" 2>/dev/null; then
-    lock_is_stale "$udid" || return 1
+    reclaim_stale_lock "$udid" || return 1
     echo "simlease: reclaiming stale lock for $udid" >&2
-    rm -rf "$LOCK_DIR/$udid" 2>/dev/null || true
     mkdir "$LOCK_DIR/$udid" 2>/dev/null || return 1
   fi
-  printf '%s\n%s\n%s\n' "${PPID:-$$}" "$(now)" "$(session_id)" > "$(lock_meta "$udid")" 2>/dev/null || true
+  [[ "$kind" != lifecycle ]] || pid="$$"
+  if ! printf '%s\n%s\n%s\n%s\n' "$pid" "$(now)" "$(session_id)" "$kind" > "$LOCK_DIR/$udid/meta.tmp" 2>/dev/null || ! mv "$LOCK_DIR/$udid/meta.tmp" "$(lock_meta "$udid")"; then
+    rm -rf "$LOCK_DIR/$udid" 2>/dev/null || true
+    return 1
+  fi
   HELD_LOCKS="$HELD_LOCKS $udid"
   return 0
 }
 
 drop_lock() {
   local udid="$1" remaining="" held
+  case " $HELD_LOCKS " in *" $udid "*) ;; *) return 1 ;; esac
   rm -rf "$LOCK_DIR/$udid" 2>/dev/null || true
   for held in $HELD_LOCKS; do
     [[ "$held" == "$udid" ]] || remaining="$remaining $held"
   done
   HELD_LOCKS="$remaining"
+}
+
+run_readiness_stage() {
+  simctl "$1" "$2" >/dev/null 2>&1
+}
+
+cmd_owned_lifecycle() {
+  local action="$1" udid="${2:-}" file purpose heartbeat ttl age state count rc=0
+  [[ $# == 2 && "$udid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || { echo "simlease: expected a simulator UUID" >&2; return 2; }
+  [[ -n "${SIMLEASE_SESSION:-}" ]] || { echo "simlease: set SIMLEASE_SESSION for $action" >&2; return 4; }
+  claim_lock "$udid" lifecycle || { echo "simlease: device is locked" >&2; return 4; }
+  file="$(lease_file "$udid")"
+  if [[ ! -f "$file" ]] || ! jq -e --arg udid "$udid" --arg owner "$SIMLEASE_SESSION" \
+    'type == "object" and .udid == $udid and .owner == $owner and (.purpose | type == "string" and length > 0) and (.heartbeat_at | type == "number" and floor == .)' "$file" >/dev/null 2>&1; then
+    echo "simlease: no readable lease owned by this session for $udid" >&2
+    drop_lock "$udid"; return 4
+  fi
+  purpose="$(lease_field "$udid" purpose '')"
+  heartbeat="$(lease_field "$udid" heartbeat_at 0)"
+  ttl="$(lease_ttl "$purpose")"
+  if [[ ! "$ttl" =~ ^[0-9]+$ ]] || (( ttl == 0 )); then drop_lock "$udid"; return 4; fi
+  age=$(( $(now) - heartbeat ))
+  if (( age < 0 || age >= ttl )) || device_in_active_build "$udid" || ! pool_devices "$purpose" | awk -F'\t' -v udid="$udid" '$1 == udid { found = 1 } END { exit !found }'; then
+    echo "simlease: expired, busy or unavailable device $udid" >&2
+    drop_lock "$udid"; return 4
+  fi
+  state="$(device_state "$udid")"
+  if [[ "$state" != Booted && "$state" != Shutdown ]]; then drop_lock "$udid"; return 4; fi
+  if ! claim_lock boot-capacity lifecycle; then drop_lock "$udid"; return 4; fi
+  if [[ "$state" == Shutdown ]]; then
+    if ! count="$(booted_count)" || [[ ! "$count" =~ ^[0-9]+$ ]]; then drop_lock boot-capacity; drop_lock "$udid"; return 4; fi
+    local maximum
+    maximum="$(guard_field max_booted_devices)"; maximum="${maximum:-6}"
+    if [[ ! "$maximum" =~ ^[0-9]+$ ]] || (( count >= maximum )); then drop_lock boot-capacity; drop_lock "$udid"; return 4; fi
+  fi
+  if [[ "$action" == reboot && "$state" == Booted ]]; then
+    if run_readiness_stage shutdown "$udid"; then invalidate_devices_json; else rc=$?; fi
+  fi
+  if (( rc == 0 )); then
+    if boot_and_probe "$udid"; then :; else rc=$?; fi
+  fi
+  drop_lock boot-capacity
+  if (( rc == 0 )); then
+    if cmd_heartbeat "$udid" >/dev/null; then printf '%s\n' "$udid"; else rc=$?; fi
+  fi
+  drop_lock "$udid"
+  return "$rc"
 }
 
 device_state() {
@@ -449,12 +536,15 @@ cmd_acquire() {
       lease_is_live "$udid" && continue
       device_is_busy "$udid" && continue
       claim_lock "$udid" || continue
+      if ! claim_lock boot-capacity lifecycle; then drop_lock "$udid"; break; fi
 
       state="$(device_state "$udid")"
       was_booted=false
       [[ "$state" != "Booted" ]] || was_booted=true
 
-      if [[ "$was_booted" == false ]] && (( $(booted_count) >= max_booted )); then
+      local boot_count
+      if [[ "$was_booted" == false ]] && { ! boot_count="$(booted_count)" || [[ ! "$boot_count" =~ ^[0-9]+$ ]] || [[ ! "$max_booted" =~ ^[0-9]+$ ]] || (( boot_count >= max_booted )); }; then
+        drop_lock boot-capacity
         drop_lock "$udid"
         echo "simlease: $max_booted devices already booted; not booting another right now" >&2
         break
@@ -470,6 +560,7 @@ cmd_acquire() {
       else
         echo "simlease: skipping unhealthy device $name ($udid)" >&2
       fi
+      drop_lock boot-capacity
       drop_lock "$udid"
     done < <(pool_devices_by_name "$purpose" | head -n "$max_devices")
 
@@ -796,8 +887,9 @@ cmd_gc() {
     if [[ "$dry_run" == true ]]; then
       echo "simlease: would drop the stale lock for $lock_udid"
     else
-      echo "simlease: dropping the stale lock for $lock_udid"
-      rm -rf "$dir" 2>/dev/null || true
+      if reclaim_stale_lock "$lock_udid"; then
+        echo "simlease: dropped the stale lock for $lock_udid"
+      fi
     fi
   done
 
@@ -877,6 +969,7 @@ case "$command" in
   acquire) cmd_acquire "$@" ;;
   release) cmd_release "$@" ;;
   reclaim-unleased) cmd_reclaim_unleased "$@" ;;
+  resume|reboot) cmd_owned_lifecycle "$command" "$@" ;;
   heartbeat) cmd_heartbeat "$@" ;;
   status) cmd_status "$@" ;;
   gc) cmd_gc "$@" ;;

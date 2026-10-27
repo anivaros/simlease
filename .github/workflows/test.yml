@@ -17,3 +17,5 @@ jobs:
         run: test/run.sh
       - name: Tests (macOS /bin/bash 3.2)
         run: test/run.sh /bin/bash
+      - name: Lifecycle ownership checks
+        run: python3 test/test_lifecycle_mutation.py

@@ -64,12 +64,16 @@ while sleep 300; do simlease heartbeat "$udid"; done &
 | `status` | Leases, their owners and ages, held locks, booted devices, active builds, load. |
 | `gc [--dry-run] [--aggressive]` | Reclaims dead sessions' devices (see below). |
 | `reclaim-unleased --purpose P <udid>` | Shuts down one unleased device that simlease booted. |
+| `resume <udid>` | Boots and checks a device held by the current session's live lease. |
+| `reboot <udid>` | Restarts and checks a device held by the current session's live lease. |
 | `doctor` | Resolved pools, their devices and `status`. |
 | `version` | Prints the version. |
 
 Exit codes: `0` ok, `2` usage or config error, `3` nothing acquired, `4` partial failure (for example a lease owned by someone else).
 
 The lease owner is `SIMLEASE_SESSION`, or `user@<git toplevel or cwd>` when it is unset. Set it explicitly in agents: two shells of the same session must agree on it.
+
+`resume` and `reboot` require an explicit `SIMLEASE_SESSION` matching the live lease. They retain the lease and refuse unavailable devices, active builds, and booting beyond the configured limit. A failed restart can leave the device shut down; the lease remains in place.
 
 ## Configuration
 
@@ -163,6 +167,8 @@ And make the rule mechanical. For Claude Code, deny direct device management in 
 ```bash
 test/run.sh             # bash on PATH
 test/run.sh /bin/bash   # macOS bash 3.2
+python3 test/test_lifecycle.py  # isolated lifecycle and ownership checks
+python3 test/test_lifecycle_mutation.py  # verify ownership and expiry checks detect regressions
 ```
 
 The tests run `simlease` against a fake `xcrun simctl` ([`test/stub/xcrun`](test/stub/xcrun)) in a temporary state directory, so they never touch your real simulators.

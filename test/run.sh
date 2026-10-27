@@ -275,6 +275,21 @@ test_max_booted_guard_stops_booting() {
   expect "nothing booted" [ "$(state_of SE-1)" = Shutdown ]
 }
 
+test_owned_lifecycle_cli() {
+  local udid=11111111-1111-1111-1111-111111111111 out
+  awk -F'\t' -v OFS='\t' -v id="$udid" '$1 == "SE-1" { $1 = id } { print }' "$STUB_DIR/devices.tsv" > "$STUB_DIR/t"
+  mv "$STUB_DIR/t" "$STUB_DIR/devices.tsv"
+  mkdir -p "$SIMLEASE_STATE_DIR/leases"
+  jq -n --arg udid "$udid" --argjson now "$(date +%s)" '{udid:$udid,owner:"me",purpose:"test",heartbeat_at:$now,acquired_at:$now}' > "$(lease "$udid")"
+  out="$(sl resume "$udid")" || return 1
+  expect "resume returns the leased UUID" [ "$out" = "$udid" ] || return 1
+  expect "resume boots the device" [ "$(state_of "$udid")" = Booted ] || return 1
+  out="$(sl reboot "$udid")" || return 1
+  expect "reboot returns the leased UUID" [ "$out" = "$udid" ] || return 1
+  expect "reboot retains the lease" [ -f "$(lease "$udid")" ] || return 1
+  expect "reboot leaves the device booted" [ "$(state_of "$udid")" = Booted ]
+}
+
 test_unhealthy_device_is_skipped() {
   export STUB_PROBE_FAIL=SE-1
   expect "next healthy device" [ "$(sl acquire --purpose test)" = SE-2 ]
