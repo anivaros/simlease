@@ -618,6 +618,12 @@ prepare_candidate() {
       return 1
     fi
     event=erased
+  elif pool_is_sticky "$purpose"; then
+    local previous
+    previous="$(last_owner "$udid")"
+    if [[ -n "$previous" && "$previous" != "$(session_id)" ]]; then
+      echo "simlease: note: $name ($udid) was last used by $previous; its apps and data are still on it" >&2
+    fi
   fi
   [[ -n "$event" ]] || return 0
   run_prepare "$purpose" "$udid" "$event"

@@ -358,6 +358,20 @@ test_sticky_prefers_last_owner() {
   expect "a gets its device back" [ "$(OWNER=a sl acquire --purpose test)" = SE-1 ]
 }
 
+test_sticky_handover_notes_previous_owner() {
+  sticky_pool
+  edit_config '.pools.test.max_devices = 1'
+  OWNER=a sl acquire --purpose test >/dev/null 2>"$WORK/first.err"
+  expect "no note for a never-used device" [ "$(grep -c 'was last used by' "$WORK/first.err")" = 0 ]
+  OWNER=a sl release SE-1
+  OWNER=a sl acquire --purpose test >/dev/null 2>"$WORK/own.err"
+  expect "no note for the same owner" [ "$(grep -c 'was last used by' "$WORK/own.err")" = 0 ]
+  OWNER=a sl release SE-1
+  expect "b gets a's device" [ "$(OWNER=b sl acquire --purpose test 2>"$WORK/other.err")" = SE-1 ]
+  expect "b is told who used it" grep -q 'SE-1) was last used by a;' "$WORK/other.err"
+  expect "nothing was erased" [ "$(calls_of 'erase SE-1')" = 0 ]
+}
+
 test_sticky_same_owner_reacquire_returns_same_device() {
   sticky_pool
   OWNER=a sl acquire --purpose test >/dev/null
