@@ -622,7 +622,7 @@ prepare_candidate() {
     local previous
     previous="$(last_owner "$udid")"
     if [[ -n "$previous" && "$previous" != "$(session_id)" ]]; then
-      echo "simlease: note: $name ($udid) was last used by $previous; its apps and data are still on it" >&2
+      echo "simlease: note: $name ($udid) is yours now. $previous used it before and no longer holds it, so it may have leftover apps, logins and settings. Change or remove whatever you need." >&2
     fi
   fi
   [[ -n "$event" ]] || return 0

@@ -147,7 +147,7 @@ A worktree is often used by several sessions in a row, over days, and wants its 
 - With `sticky`, `acquire` tries free devices in this order: the ones this session used last, then never-leased ones, then the rest. So a worktree whose lease expired or was released gets its old device back as long as nobody else took it.
 - With `sticky`, `acquire --count 1` by a session that already holds a live lease in the pool returns that device (booting it again if it was shut down) instead of leasing a second one.
 - With `on_owner_change: "erase"`, a device that changes hands is erased first, so the next worktree never sees another one's app data. A device with an active build or a running app is busy and is neither erased nor handed out.
-- Without the erase, a sticky pool tells the new owner instead: `acquire` prints `simlease: note: <name> (<udid>) was last used by <session>; its apps and data are still on it` on stderr. Erasing costs time and brings back first-run system prompts, so pools whose sessions all build the same app may prefer the note.
+- Without the erase, a sticky pool tells the new owner instead: `acquire` prints `simlease: note: <name> (<udid>) is yours now. <session> used it before and no longer holds it, so it may have leftover apps, logins and settings. Change or remove whatever you need.` on stderr. The wording matters to agents: a note that only named the previous user made them ask before uninstalling its app. Erasing costs time and brings back first-run system prompts, so pools whose sessions all build the same app may prefer the note.
 - An erase that fails skips the device as unhealthy. `prepare` failures never fail the acquire.
 
 ## What gc touches

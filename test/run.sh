@@ -362,13 +362,13 @@ test_sticky_handover_notes_previous_owner() {
   sticky_pool
   edit_config '.pools.test.max_devices = 1'
   OWNER=a sl acquire --purpose test >/dev/null 2>"$WORK/first.err"
-  expect "no note for a never-used device" [ "$(grep -c 'was last used by' "$WORK/first.err")" = 0 ]
+  expect "no note for a never-used device" [ "$(grep -c 'used it before' "$WORK/first.err")" = 0 ]
   OWNER=a sl release SE-1
   OWNER=a sl acquire --purpose test >/dev/null 2>"$WORK/own.err"
-  expect "no note for the same owner" [ "$(grep -c 'was last used by' "$WORK/own.err")" = 0 ]
+  expect "no note for the same owner" [ "$(grep -c 'used it before' "$WORK/own.err")" = 0 ]
   OWNER=a sl release SE-1
   expect "b gets a's device" [ "$(OWNER=b sl acquire --purpose test 2>"$WORK/other.err")" = SE-1 ]
-  expect "b is told who used it" grep -q 'SE-1) was last used by a;' "$WORK/other.err"
+  expect "b is told who used it" grep -q 'SE-1) is yours now. a used it before and no longer holds it' "$WORK/other.err"
   expect "nothing was erased" [ "$(calls_of 'erase SE-1')" = 0 ]
 }
 
