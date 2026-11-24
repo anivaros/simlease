@@ -61,7 +61,9 @@ while sleep 300; do simlease heartbeat "$udid"; done &
 | `release <udid>… [--force]` | Ends your lease and applies the pool's release policy. Refuses leases owned by another session unless `--force`. |
 | `release --all-mine [--purpose P]` | Releases every lease owned by `SIMLEASE_SESSION`. |
 | `heartbeat <udid>…` | Extends your lease. |
-| `status` | Leases, their owners and ages, held locks, booted devices, active builds, load. |
+| `heartbeat --all-mine [--purpose P]` | Extends every lease owned by `SIMLEASE_SESSION`. Prints nothing and exits 0 also when there are none. |
+| `status [--mine] [--purpose P]` | Leases, their owners and ages, held locks, booted devices, active builds, load. `--mine` and `--purpose` filter the leases. |
+| `status --mine --print udid [--purpose P]` | Prints the UDIDs of your live leases, one per line; empty output when there are none. |
 | `gc [--dry-run] [--aggressive]` | Reclaims dead sessions' devices (see below). |
 | `reclaim-unleased --purpose P <udid>` | Shuts down one unleased device that simlease booted. |
 | `resume <udid>` | Boots and checks a device held by the current session's live lease. |
@@ -110,6 +112,9 @@ Pool keys:
 - `release` (required): `shutdown` shuts the device down on release, `restore` shuts it down only if simlease booted it, `keep-booted` leaves it running (for a device a human is looking at).
 - `gui`: open Simulator.app after acquiring.
 - `lease_ttl_seconds`: a lease without a heartbeat for this long is stale. Default 1200.
+- `sticky`: prefer the device this session used last (see [Sticky pools](#sticky-pools)). Default `false`.
+- `on_owner_change`: `none` (default) or `erase`. With `erase`, `acquire` shuts down and erases a device before handing it to a session that was not its last owner, including its first use.
+- `prepare`: a shell command run after a device is auto-created or erased, while it is shut down and before it boots. It gets `SIMLEASE_UDID`, `SIMLEASE_PURPOSE` and `SIMLEASE_POOL_EVENT` (`created` or `erased`) in the environment; its output goes to stderr. A non-zero exit or a timeout (`SIMLEASE_PREPARE_TIMEOUT`, default 300 s) prints a warning and the acquire continues with the device as it is.
 
 Guards:
 
@@ -117,7 +122,32 @@ Guards:
 - `auto_created_device_ttl_hours`: `gc` deletes auto-created devices unleased for this long.
 - `sweep_unleased_booted`: `gc` shuts down booted devices in `shutdown` pools that simlease booted and nobody leases.
 
-Environment: `SIMLEASE_STATE_DIR` (default `~/Library/Application Support/simlease`), `SIMLEASE_SIMCTL_TIMEOUT` (120 s per `simctl` call), `SIMLEASE_BOOTSTATUS_TIMEOUT` (180 s), `SIMLEASE_LOCK_STALE_SECONDS` (420 s).
+Environment: `SIMLEASE_STATE_DIR` (default `~/Library/Application Support/simlease`), `SIMLEASE_SIMCTL_TIMEOUT` (120 s per `simctl` call), `SIMLEASE_BOOTSTATUS_TIMEOUT` (180 s), `SIMLEASE_LOCK_STALE_SECONDS` (420 s), `SIMLEASE_PREPARE_TIMEOUT` (300 s).
+
+### Sticky pools
+
+A worktree is often used by several sessions in a row, over days, and wants its simulator back with the app still installed and logged in. A different worktree wants a clean device. Give each worktree a stable `SIMLEASE_SESSION` (for example `agent/<worktree>`) and opt the pool in:
+
+```json
+"agent": {
+  "model": "iPhone 17 Pro",
+  "name_prefix": "Agent Pool",
+  "max_devices": 3,
+  "auto_create": false,
+  "release": "shutdown",
+  "gui": false,
+  "lease_ttl_seconds": 3600,
+  "sticky": true,
+  "on_owner_change": "erase",
+  "prepare": "my-tool setup \"$SIMLEASE_UDID\""
+}
+```
+
+- simlease remembers the last owner of every device in `<state>/last/<udid>`. Release and `gc` keep it; it goes away only with the device.
+- With `sticky`, `acquire` tries free devices in this order: the ones this session used last, then never-leased ones, then the rest. So a worktree whose lease expired or was released gets its old device back as long as nobody else took it.
+- With `sticky`, `acquire --count 1` by a session that already holds a live lease in the pool returns that device (booting it again if it was shut down) instead of leasing a second one.
+- With `on_owner_change: "erase"`, a device that changes hands is erased first, so the next worktree never sees another one's app data. A device with an active build or a running app is busy and is neither erased nor handed out.
+- An erase that fails skips the device as unhealthy. `prepare` failures never fail the acquire.
 
 ## What gc touches
 
@@ -143,7 +173,7 @@ Never pick, boot or create simulators by hand. Take them from simlease:
     simlease acquire --purpose visual                              # looking at the app: iPhone 17 Pro
     trap 'simlease release --all-mine' EXIT
 
-Heartbeat runs longer than the pool TTL with `simlease heartbeat <udid>`. Never shut down or delete a device you did not lease.
+Heartbeat runs longer than the pool TTL with `simlease heartbeat <udid>` (or `simlease heartbeat --all-mine`). Never shut down or delete a device you did not lease.
 ```
 
 And make the rule mechanical. For Claude Code, deny direct device management in `~/.claude/settings.json`:

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Fake `xcrun simctl` backed by $STUB_DIR/devices.tsv:
 # udid <TAB> name <TAB> device type identifier <TAB> runtime <TAB> state
+# Every call is appended to $STUB_DIR/calls.log as "simctl <args>".
+# STUB_ERASE_FAIL=<udid> makes `simctl erase` fail for that device.
 set -euo pipefail
 
 db="$STUB_DIR/devices.tsv"
@@ -65,6 +67,12 @@ case "$1 ${2:-}" in
     ;;
   shutdown\ *)
     set_state "$2" Shutdown
+    ;;
+  erase\ *)
+    has_device "$2" || exit 1
+    [[ "${STUB_ERASE_FAIL:-}" != "$2" ]] || { echo "stub xcrun: erase failed" >&2; exit 1; }
+    state="$(awk -F'\t' -v udid="$2" '$1 == udid { print $5 }' "$db")"
+    [[ "$state" == Shutdown ]] || { echo "Unable to erase contents and settings in current state: $state" >&2; exit 149; }
     ;;
   create\ *)
     udid="$(uuidgen)"
