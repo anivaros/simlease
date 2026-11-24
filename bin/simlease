@@ -316,6 +316,7 @@ extend_lease() {
   tmp="$file.tmp.$$"
   if jq --argjson heartbeat "$(now)" '.heartbeat_at = $heartbeat' "$file" > "$tmp" 2>/dev/null; then
     mv "$tmp" "$file"
+    [[ ! -f "$LAST_DIR/$udid" ]] || touch "$LAST_DIR/$udid" 2>/dev/null || true
   else
     rm -f "$tmp"
     echo "simlease: could not update the heartbeat for $udid" >&2
@@ -575,22 +576,28 @@ pool_candidates() {
   fi
 }
 
+last_used_at() {
+  stat -f %m "$LAST_DIR/$1" 2>/dev/null || echo 0
+}
+
 order_by_last_owner() {
-  local me udid name state last group index=0
+  local me udid name state last group used index=0
   me="$(session_id)"
   while IFS=$'\t' read -r udid name state; do
     [[ -n "$udid" ]] || continue
     index=$(( index + 1 ))
     last="$(last_owner "$udid")"
+    used=0
     if [[ "$last" == "$me" ]]; then
       group=0
     elif [[ -z "$last" ]]; then
       group=1
     else
       group=2
+      used="$(last_used_at "$udid")"
     fi
-    printf '%s\t%s\t%s\t%s\t%s\n' "$group" "$index" "$udid" "$name" "$state"
-  done | LC_ALL=C sort -t$'\t' -k1,1n -k2,2n | cut -f3-
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$group" "$used" "$index" "$udid" "$name" "$state"
+  done | LC_ALL=C sort -t$'\t' -k1,1n -k2,2n -k3,3n | cut -f4-
 }
 
 run_prepare() {

@@ -372,6 +372,28 @@ test_sticky_handover_notes_previous_owner() {
   expect "nothing was erased" [ "$(calls_of 'erase SE-1')" = 0 ]
 }
 
+test_sticky_takes_the_least_recently_used_device_of_other_owners() {
+  sticky_pool
+  edit_config '.pools.test.max_devices = 2'
+  expect "a gets SE 1" [ "$(OWNER=a sl acquire --purpose test)" = SE-1 ]
+  expect "b gets SE 2" [ "$(OWNER=b sl acquire --purpose test)" = SE-2 ]
+  OWNER=a sl release SE-1
+  OWNER=b sl release SE-2
+  touch -t 202601010000 "$SIMLEASE_STATE_DIR/last/SE-2"
+  expect "c gets the device that was used longest ago" [ "$(OWNER=c sl acquire --purpose test 2>/dev/null)" = SE-2 ]
+  OWNER=c sl release SE-2
+  touch -t 202601010000 "$SIMLEASE_STATE_DIR/last/SE-1"
+  expect "d gets the other one once it is the older" [ "$(OWNER=d sl acquire --purpose test 2>/dev/null)" = SE-1 ]
+}
+
+test_heartbeat_counts_as_use() {
+  sticky_pool
+  OWNER=a sl acquire --purpose test >/dev/null
+  touch -t 202601010000 "$SIMLEASE_STATE_DIR/last/SE-1"
+  OWNER=a sl heartbeat SE-1
+  expect "last use is refreshed" [ "$(stat -f %m "$SIMLEASE_STATE_DIR/last/SE-1")" -gt "$(date -j -f %Y%m%d%H%M 202601020000 +%s)" ]
+}
+
 test_sticky_same_owner_reacquire_returns_same_device() {
   sticky_pool
   OWNER=a sl acquire --purpose test >/dev/null
