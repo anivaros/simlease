@@ -748,7 +748,11 @@ cmd_acquire() {
         drop_lock "$udid"
         continue
       fi
-      if ! claim_lock boot-capacity lifecycle; then drop_lock "$udid"; break; fi
+      if ! claim_lock boot-capacity lifecycle; then
+        drop_lock "$udid"
+        echo "simlease: another session is booting a simulator right now; pass --wait to queue behind it" >&2
+        break
+      fi
 
       state="$(device_state "$udid")"
       was_booted=false
