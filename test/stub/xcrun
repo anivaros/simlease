@@ -64,6 +64,7 @@ case "$1 ${2:-}" in
     [[ "${STUB_PROBE_FAIL:-}" != "$2" ]]
     ;;
   shutdown\ *)
+    [[ -z "${STUB_SHUTDOWN_FAIL:-}" ]] || exit 1
     set_state "$2" Shutdown
     ;;
   create\ *)

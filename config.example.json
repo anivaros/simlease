@@ -14,7 +14,7 @@
       "name_prefix": "iPhone 17 Pro",
       "max_devices": 1,
       "auto_create": true,
-      "release": "keep-booted",
+      "release": "shutdown",
       "gui": true,
       "lease_ttl_seconds": 7200
     }

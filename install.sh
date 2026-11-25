@@ -35,6 +35,11 @@ fi
 
 command -v jq >/dev/null || { echo "simlease needs jq: brew install jq" >&2; exit 1; }
 command -v xcrun >/dev/null || { echo "simlease needs Xcode command line tools" >&2; exit 1; }
+bash_bin="$(command -v bash)"
+"$bash_bin" -c '(( BASH_VERSINFO[0] >= 5 ))' || {
+  echo "simlease needs bash 5 or later as the first bash on PATH (found $bash_bin): brew install bash" >&2
+  exit 1
+}
 
 mkdir -p "$PREFIX/bin"
 install -m 0755 "$ROOT/bin/simlease" "$BIN"
@@ -60,6 +65,7 @@ if [[ "$AGENT" == true ]]; then
     <string>$LABEL</string>
     <key>ProgramArguments</key>
     <array>
+        <string>$bash_bin</string>
         <string>$BIN</string>
         <string>gc</string>
     </array>

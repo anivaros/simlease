@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SIMLEASE_VERSION="0.1.0"
+if (( BASH_VERSINFO[0] < 5 )); then
+  echo "simlease needs bash 5 or later, this is bash $BASH_VERSION: brew install bash, and put its bin folder before /bin on PATH" >&2
+  exit 2
+fi
+
+SIMLEASE_VERSION="0.2.0"
 CONFIG="${SIMLEASE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/simlease/config.json}"
 STATE_DIR="${SIMLEASE_STATE_DIR:-$HOME/Library/Application Support/simlease}"
 LEASE_DIR="$STATE_DIR/leases"
@@ -11,6 +16,11 @@ BOOTED_DIR="$STATE_DIR/booted"
 LOCK_STALE_SECONDS="${SIMLEASE_LOCK_STALE_SECONDS:-420}"
 SIMCTL_TIMEOUT="${SIMLEASE_SIMCTL_TIMEOUT:-120}"
 BOOTSTATUS_TIMEOUT="${SIMLEASE_BOOTSTATUS_TIMEOUT:-180}"
+# Pause between a failed boot and the retry; the tests set it to 0.
+RESTART_PAUSE_SECONDS="${SIMLEASE_RESTART_PAUSE_SECONDS:-3}"
+SIM_DEVICES_DIR="${SIMLEASE_SIM_DEVICES_DIR:-$HOME/Library/Developer/CoreSimulator/Devices}"
+SIM_LOGS_DIR="${SIMLEASE_SIM_LOGS_DIR:-$HOME/Library/Logs/CoreSimulator}"
+UPDATE_URL="${SIMLEASE_UPDATE_URL:-https://raw.githubusercontent.com/anivaros/simlease/main/bin/simlease}"
 
 usage() {
   cat >&2 <<'EOF'
@@ -26,16 +36,62 @@ usage:
   simlease gc [--dry-run] [--aggressive]
   simlease doctor
   simlease version
+  simlease update | upgrade
 
 Set SIMLEASE_SESSION to the same value for acquire, heartbeat and release.
-Exit codes: 0 ok, 2 usage or config error, 3 nothing acquired, 4 partial failure.
+Exit codes: 0 ok, 1 update failed, 2 usage or config error, 3 nothing acquired, 4 partial failure.
 EOF
   exit "${1:-2}"
+}
+
+update_failed() {
+  printf 'simlease: update failed: %s\n' "$1" >&2
+  exit 1
+}
+
+is_tracked_by_git() {
+  git -C "$(dirname "$1")" ls-files --error-unmatch -- "$(basename "$1")" >/dev/null 2>&1
+}
+
+# Checks the download without running it: a proxy error page would execute as shell.
+# The last line must be the end marker, so a cut download fails too.
+is_complete_simlease_script() {
+  [[ "$(head -n 1 "$1")" == "#!/usr/bin/env bash" ]] || return 1
+  grep -q '^SIMLEASE_VERSION="[^"]*"$' "$1" || return 1
+  [[ "$(tail -n 1 "$1")" == "# end of simlease"* ]] || return 1
+  "${BASH:-bash}" -n "$1" 2>/dev/null
+}
+
+cmd_update() {
+  (( $# == 0 )) || usage
+  # tmp stays global: the EXIT trap reads it after the function returns.
+  local self="${BASH_SOURCE[0]}" dir new_version
+  dir="$(dirname "$self")"
+  if [[ -L "$self" ]]; then
+    update_failed "$self is a symlink; update its target instead"
+  fi
+  if is_tracked_by_git "$self"; then
+    update_failed "$self is tracked by git; use git pull"
+  fi
+  tmp="$(mktemp "$dir/.simlease.XXXXXX" 2>/dev/null)" || update_failed "cannot write to $dir"
+  trap 'rm -f "$tmp"' EXIT
+  curl -fsSL --proto-redir =https --max-time 60 -o "$tmp" "$UPDATE_URL" || update_failed "cannot download $UPDATE_URL"
+  is_complete_simlease_script "$tmp" || update_failed "$UPDATE_URL is not a complete simlease script"
+  if cmp -s "$tmp" "$self"; then
+    printf 'simlease %s is up to date\n' "$SIMLEASE_VERSION"
+    return
+  fi
+  new_version="$(sed -n 's/^SIMLEASE_VERSION="\([^"]*\)"$/\1/p' "$tmp")"
+  chmod 0755 "$tmp"
+  # rename keeps running simlease processes on the old inode; writing in place would corrupt them.
+  mv -f "$tmp" "$self" || update_failed "cannot replace $self"
+  printf 'updated %s: simlease %s -> %s\n' "$self" "$SIMLEASE_VERSION" "$new_version"
 }
 
 case "${1:-}" in
   -h|--help|help) usage 0 ;;
   -V|--version|version) printf "simlease %s\n" "$SIMLEASE_VERSION"; exit 0 ;;
+  update|upgrade) shift; cmd_update "$@"; exit 0 ;;
 esac
 
 mkdir -p "$LEASE_DIR" "$LOCK_DIR" "$CREATED_DIR" "$BOOTED_DIR"
@@ -254,11 +310,11 @@ device_runs_app() {
   [[ -n "$matches" ]]
 }
 
-device_is_busy() {
-  local udid="$1"
-  device_in_active_build "$udid" && return 0
-  device_runs_app "$udid" && return 0
-  return 1
+# gc only respects a running xcodebuild/xctest: an app left running after its session
+# ended must not keep an abandoned device on. acquire also skips a device that runs an
+# app, because a person or an Xcode GUI test run may use it.
+device_can_be_handed_out() {
+  ! device_in_active_build "$1" && ! device_runs_app "$1"
 }
 
 simlease_booted_this() {
@@ -299,7 +355,7 @@ write_lease() {
 lock_meta() { printf '%s/%s/meta' "$LOCK_DIR" "$1"; }
 
 lock_is_stale() {
-  local udid="$1" meta pid stamp age kind
+  local udid="$1" meta pid stamp age
   meta="$(lock_meta "$udid")"
   if [[ ! -f "$meta" ]]; then
     [[ -n "$(find "$LOCK_DIR/$udid" -maxdepth 0 -mmin +1 -print 2>/dev/null)" ]]
@@ -307,15 +363,15 @@ lock_is_stale() {
   fi
   pid="$(awk 'NR==1 {print $1}' "$meta" 2>/dev/null || true)"
   stamp="$(awk 'NR==2 {print $1}' "$meta" 2>/dev/null || true)"
-  kind="$(awk 'NR==4 {print $1}' "$meta" 2>/dev/null || true)"
-  if [[ "$kind" == lifecycle && "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-    return 1
+  # A live owner keeps its lock however long it takes: acquire can hold one through
+  # two slow boot attempts. The age decides only when no owner pid is readable.
+  if [[ "$pid" =~ ^[0-9]+$ ]]; then
+    ! kill -0 "$pid" 2>/dev/null
+    return
   fi
   [[ "$stamp" =~ ^[0-9]+$ ]] || return 0
   age=$(( $(now) - stamp ))
-  (( age >= LOCK_STALE_SECONDS )) && return 0
-  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && return 1
-  return 0
+  (( age >= LOCK_STALE_SECONDS ))
 }
 
 reclaim_stale_lock() {
@@ -331,13 +387,14 @@ reclaim_stale_lock() {
 }
 
 claim_lock() {
-  local udid="$1" kind="${2:-}" pid="${PPID:-$$}"
+  # The owner is this simlease process: its EXIT trap drops the lock. The parent pid
+  # would be wrong: under launchd it is 1, and `kill -0 1` fails, so the lock looks stale.
+  local udid="$1" kind="${2:-}" pid="$$"
   if ! mkdir "$LOCK_DIR/$udid" 2>/dev/null; then
     reclaim_stale_lock "$udid" || return 1
     echo "simlease: reclaiming stale lock for $udid" >&2
     mkdir "$LOCK_DIR/$udid" 2>/dev/null || return 1
   fi
-  [[ "$kind" != lifecycle ]] || pid="$$"
   if ! printf '%s\n%s\n%s\n%s\n' "$pid" "$(now)" "$(session_id)" "$kind" > "$LOCK_DIR/$udid/meta.tmp" 2>/dev/null || ! mv "$LOCK_DIR/$udid/meta.tmp" "$(lock_meta "$udid")"; then
     rm -rf "$LOCK_DIR/$udid" 2>/dev/null || true
     return 1
@@ -408,6 +465,39 @@ device_state() {
   devices_json | jq -r --arg udid "$1" '.devices | to_entries[] | .value[] | select(.udid == $udid) | .state'
 }
 
+remove_host_logs() {
+  [[ "$1" =~ ^[A-Za-z0-9-]+$ ]] || return 0
+  rm -rf "${SIM_LOGS_DIR:?}/$1" 2>/dev/null || true
+}
+
+# Removes the files of logs and temp folders; apps, their data and settings stay.
+# The folders themselves stay too, so logd and apps find the layout they expect.
+# Call it only on a shut-down device: a booted one still writes to these folders.
+clean_device_logs_and_tmp() {
+  local udid="$1" data dir
+  [[ "$udid" =~ ^[A-Za-z0-9-]+$ ]] || return 0
+  data="$SIM_DEVICES_DIR/$udid/data"
+  for dir in "$data/tmp" "$data/Library/Logs" "$data/var/db/diagnostics" "$data/var/db/uuidtext" \
+    "$data"/Containers/Data/Application/*/tmp; do
+    [[ -d "$dir" && ! -L "$dir" ]] || continue
+    find "$dir" -mindepth 1 ! -type d -delete 2>/dev/null || true
+  done
+  remove_host_logs "$udid"
+}
+
+# Shuts a device down after its lease ends (or it was left unleased) and cleans it.
+# If the shutdown fails, the device gets a boot marker, so the gc sweep tries again.
+shutdown_and_clean_device() {
+  simctl shutdown "$1" >/dev/null 2>&1 || true
+  if [[ "$(device_state "$1")" != "Shutdown" ]]; then
+    echo "simlease: could not shut down $1; gc will try again" >&2
+    mark_booted_by_simlease "$1"
+    return 0
+  fi
+  clear_booted_marker "$1"
+  clean_device_logs_and_tmp "$1"
+}
+
 boot_and_probe() {
   local udid="$1" attempt status
   for attempt in 1 2; do
@@ -425,7 +515,7 @@ boot_and_probe() {
     echo "simlease: $udid did not answer after boot (attempt $attempt); restarting it" >&2
     simctl shutdown "$udid" >/dev/null 2>&1 || true
     invalidate_devices_json
-    sleep 3
+    sleep "$RESTART_PAUSE_SECONDS"
   done
   return 1
 }
@@ -534,7 +624,7 @@ cmd_acquire() {
       (( acquired_count < count )) || break
       [[ -n "$udid" ]] || continue
       lease_is_live "$udid" && continue
-      device_is_busy "$udid" && continue
+      device_can_be_handed_out "$udid" || continue
       claim_lock "$udid" || continue
       if ! claim_lock boot-capacity lifecycle; then drop_lock "$udid"; break; fi
 
@@ -608,6 +698,14 @@ cmd_acquire() {
   done
 }
 
+# auto_created_device_ttl_hours counts idle time, so each release restarts it.
+# Only an existing marker is refreshed: a new one would make a hand-made device deletable.
+restart_idle_ttl() {
+  if [[ -f "$CREATED_DIR/$1" ]]; then
+    touch "$CREATED_DIR/$1"
+  fi
+}
+
 release_one() {
   local udid="$1" force="${2:-false}" file purpose policy was_booted owner acquired_at
   file="$(lease_file "$udid")"
@@ -639,21 +737,19 @@ release_one() {
   purpose="$(lease_field "$udid" purpose test)"
   was_booted="$(lease_field "$udid" was_booted false)"
   policy="$(pool_field "$purpose" release)"
+  # Before the lease goes: gc may delete an idle device the moment it is unleased.
+  restart_idle_ttl "$udid"
   rm -f "$file"
   case "$policy" in
     shutdown)
       # Automated-test pools are owned by the lease for their whole lifecycle.
       # Their configured shutdown policy must clear system services even when a
       # previous lease did not create the booted simulator process.
-      simctl shutdown "$udid" >/dev/null 2>&1 || true
-      clear_booted_marker "$udid"
-      invalidate_devices_json
+      shutdown_and_clean_device "$udid"
       ;;
     restore)
       if simlease_booted_this "$udid"; then
-        simctl shutdown "$udid" >/dev/null 2>&1 || true
-        clear_booted_marker "$udid"
-        invalidate_devices_json
+        shutdown_and_clean_device "$udid"
       else
         echo "simlease: leaving $udid booted; simlease did not boot it" >&2
       fi
@@ -753,9 +849,7 @@ cmd_reclaim_unleased() {
     echo "simlease: $udid acquired a lease while reclaiming; leaving it alone" >&2
     exit 4
   fi
-  simctl shutdown "$udid" >/dev/null 2>&1 || true
-  clear_booted_marker "$udid"
-  invalidate_devices_json
+  shutdown_and_clean_device "$udid"
   drop_lock "$udid"
   echo "simlease: reclaimed unleased $purpose device $udid" >&2
 }
@@ -831,17 +925,8 @@ cmd_status() {
     "$(sysctl -n vm.loadavg | tr -d '{}')"
 }
 
-cmd_gc() {
-  local dry_run=false aggressive=false
-  while (( $# )); do
-    case "$1" in
-      --dry-run) dry_run=true; shift ;;
-      --aggressive) aggressive=true; shift ;;
-      *) usage ;;
-    esac
-  done
-
-  local file udid purpose policy acquired_at
+gc_reclaim_stale_leases() {
+  local dry_run="$1" aggressive="$2" file udid purpose policy acquired_at
   for file in "$LEASE_DIR"/*.json; do
     [[ -e "$file" ]] || continue
     if ! lease_valid "$file"; then
@@ -854,7 +939,7 @@ cmd_gc() {
     fi
     udid="$(basename "$file" .json)"
     lease_is_live "$udid" && continue
-    device_is_busy "$udid" && continue
+    device_in_active_build "$udid" && continue
 
     purpose="$(lease_field "$udid" purpose test)"
     policy="$(pool_field "$purpose" release)"
@@ -878,8 +963,10 @@ cmd_gc() {
     echo "simlease: reclaiming the stale lease for $udid ($purpose)"
     release_one "$udid" true || true
   done
+}
 
-  local dir lock_udid
+gc_drop_stale_locks() {
+  local dry_run="$1" dir lock_udid
   for dir in "$LOCK_DIR"/*; do
     [[ -d "$dir" ]] || continue
     lock_udid="$(basename "$dir")"
@@ -892,39 +979,68 @@ cmd_gc() {
       fi
     fi
   done
+}
 
-  local sweep_enabled sweep_pool sweep_udid sweep_name sweep_state
-  sweep_enabled="$(guard_field sweep_unleased_booted)"
-  if [[ "$sweep_enabled" != "false" ]]; then
-    for sweep_pool in $(jq -r '.pools | to_entries[] | select(.value.release == "shutdown") | .key' "$CONFIG"); do
-      while IFS=$'\t' read -r sweep_udid sweep_name sweep_state; do
-        [[ -n "$sweep_udid" ]] || continue
-        if [[ "$sweep_state" != "Booted" ]]; then
-          clear_booted_marker "$sweep_udid"
-          continue
-        fi
-        [[ -f "$(lease_file "$sweep_udid")" ]] && continue
-        simlease_booted_this "$sweep_udid" || continue
-        device_is_busy "$sweep_udid" && continue
-        if [[ "$dry_run" == true ]]; then
-          echo "simlease: would shut down unleased $sweep_name ($sweep_udid)"
-          continue
-        fi
-        claim_lock "$sweep_udid" || continue
-        if [[ -f "$(lease_file "$sweep_udid")" ]] || device_is_busy "$sweep_udid"; then
-          drop_lock "$sweep_udid"
-          continue
-        fi
-        echo "simlease: shutting down unleased $sweep_name ($sweep_udid)"
-        simctl shutdown "$sweep_udid" >/dev/null 2>&1 || true
-        clear_booted_marker "$sweep_udid"
-        invalidate_devices_json
-        drop_lock "$sweep_udid"
-      done < <(pool_devices_by_name "$sweep_pool")
-    done
+# A booted device that simlease booted, nobody leases and no build uses was left behind.
+unleased_device_can_be_swept() {
+  [[ ! -f "$(lease_file "$1")" ]] || return 1
+  simlease_booted_this "$1" || return 1
+  ! device_in_active_build "$1"
+}
+
+# A boot marker on a shut-down device means its cleanup did not run, for example
+# because the shutdown timed out. Clean it now; the lock keeps acquire away.
+finish_cleanup_of_shut_down_device() {
+  local udid="$1"
+  simlease_booted_this "$udid" || return 0
+  claim_lock "$udid" || return 0
+  if [[ "$(device_state "$udid")" == "Shutdown" ]] && [[ ! -f "$(lease_file "$udid")" ]]; then
+    clean_device_logs_and_tmp "$udid"
+    clear_booted_marker "$udid"
   fi
+  drop_lock "$udid"
+}
 
-  local ttl_hours created_file created_udid
+gc_sweep_unleased_booted() {
+  local dry_run="$1" sweep_pool sweep_udid sweep_name sweep_state
+  [[ "$(guard_field sweep_unleased_booted)" != "false" ]] || return 0
+  for sweep_pool in $(jq -r '.pools | to_entries[] | select(.value.release == "shutdown") | .key' "$CONFIG"); do
+    while IFS=$'\t' read -r sweep_udid sweep_name sweep_state; do
+      [[ -n "$sweep_udid" ]] || continue
+      # A booting or shutting-down device keeps its marker until it settles.
+      if [[ "$sweep_state" == "Shutdown" && "$dry_run" != true ]]; then
+        finish_cleanup_of_shut_down_device "$sweep_udid"
+      fi
+      [[ "$sweep_state" == "Booted" ]] || continue
+      unleased_device_can_be_swept "$sweep_udid" || continue
+      if [[ "$dry_run" == true ]]; then
+        echo "simlease: would shut down unleased $sweep_name ($sweep_udid)"
+        continue
+      fi
+      claim_lock "$sweep_udid" || continue
+      if ! unleased_device_can_be_swept "$sweep_udid"; then
+        drop_lock "$sweep_udid"
+        continue
+      fi
+      echo "simlease: shutting down unleased $sweep_name ($sweep_udid)"
+      shutdown_and_clean_device "$sweep_udid"
+      drop_lock "$sweep_udid"
+    done < <(pool_devices_by_name "$sweep_pool")
+  done
+}
+
+# Only a shut-down device is deleted. A booted one may be in use without a lease, for
+# example from Xcode's Run. The sweep runs first, so an abandoned device is off by now.
+created_device_is_idle() {
+  local udid="$1" ttl_hours="$2"
+  [[ ! -f "$(lease_file "$udid")" ]] || return 1
+  [[ "$(device_state "$udid")" == "Shutdown" ]] || return 1
+  ! device_in_active_build "$udid" || return 1
+  [[ -n "$(find "$CREATED_DIR/$udid" -mmin +$(( ttl_hours * 60 )) 2>/dev/null)" ]]
+}
+
+gc_delete_idle_created_devices() {
+  local dry_run="$1" ttl_hours created_file created_udid
   if [[ "$dry_run" != true ]]; then
     prune_created_markers
   fi
@@ -933,19 +1049,43 @@ cmd_gc() {
   for created_file in "$CREATED_DIR"/*; do
     [[ -f "$created_file" ]] || continue
     created_udid="$(basename "$created_file")"
-    [[ -f "$(lease_file "$created_udid")" ]] && continue
-    device_is_busy "$created_udid" && continue
-    [[ -n "$(find "$created_file" -mmin +$(( ttl_hours * 60 )) 2>/dev/null)" ]] || continue
+    created_device_is_idle "$created_udid" "$ttl_hours" || continue
     if [[ "$dry_run" == true ]]; then
-      echo "simlease: would delete auto-created device $created_udid (older than ${ttl_hours}h, unleased)"
+      echo "simlease: would delete auto-created device $created_udid (unleased for ${ttl_hours}h)"
       continue
     fi
-    echo "simlease: deleting auto-created device $created_udid (older than ${ttl_hours}h, unleased)"
+    # acquire holds the lock for minutes before it writes the lease: check again under the lock.
+    claim_lock "$created_udid" || continue
+    if ! created_device_is_idle "$created_udid" "$ttl_hours"; then
+      drop_lock "$created_udid"
+      continue
+    fi
+    echo "simlease: deleting auto-created device $created_udid (unleased for ${ttl_hours}h)"
     simctl shutdown "$created_udid" >/dev/null 2>&1 || true
-    simctl delete "$created_udid" >/dev/null 2>&1 || true
-    rm -f "$created_file"
+    # Keep the marker when the delete fails, so the next gc tries again.
+    if simctl delete "$created_udid" >/dev/null 2>&1; then
+      rm -f "$created_file"
+      clear_booted_marker "$created_udid"
+      remove_host_logs "$created_udid"
+    fi
     invalidate_devices_json
+    drop_lock "$created_udid"
   done
+}
+
+cmd_gc() {
+  local dry_run=false aggressive=false
+  while (( $# )); do
+    case "$1" in
+      --dry-run) dry_run=true; shift ;;
+      --aggressive) aggressive=true; shift ;;
+      *) usage ;;
+    esac
+  done
+  gc_reclaim_stale_leases "$dry_run" "$aggressive"
+  gc_drop_stale_locks "$dry_run"
+  gc_sweep_unleased_booted "$dry_run"
+  gc_delete_idle_created_devices "$dry_run"
 }
 
 cmd_doctor() {
@@ -976,3 +1116,4 @@ case "$command" in
   doctor) cmd_doctor "$@" ;;
   *) usage ;;
 esac
+# end of simlease: `update` requires this line, so a cut download is never installed.

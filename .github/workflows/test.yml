@@ -9,13 +9,13 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Syntax
+      - name: Bash 5
         run: |
-          bash -n bin/simlease install.sh test/run.sh test/stub/xcrun
-          /bin/bash -n bin/simlease
-      - name: Tests (bash on PATH)
+          brew list bash >/dev/null 2>&1 || brew install bash
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+      - name: Syntax
+        run: bash -n bin/simlease install.sh test/run.sh test/stub/xcrun
+      - name: Tests
         run: test/run.sh
-      - name: Tests (macOS /bin/bash 3.2)
-        run: test/run.sh /bin/bash
       - name: Lifecycle ownership checks
         run: python3 test/test_lifecycle_mutation.py
