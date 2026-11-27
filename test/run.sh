@@ -30,7 +30,7 @@ setup() {
   printf '#!/bin/sh\nexit 0\n' > "$WORK/bin/open"
   chmod +x "$WORK/bin/xcrun" "$WORK/bin/open"
   export PATH="$WORK/bin:$ORIGINAL_PATH"
-  unset STUB_BOOTSTATUS_HANG STUB_PROBE_FAIL STUB_ERASE_FAIL STUB_SHUTDOWN_FAIL STUB_LIST_FAIL SIMLEASE_PREPARE_TIMEOUT
+  unset STUB_BOOTSTATUS_HANG STUB_PROBE_FAIL STUB_ERASE_FAIL STUB_SHUTDOWN_FAIL STUB_SHUTDOWN_FAIL_AFTER_STATE STUB_SHUTDOWN_HANG STUB_SHUTDOWN_HANG_AFTER_STATE STUB_LIST_FAIL SIMLEASE_PREPARE_TIMEOUT
   jq '.pools.test.auto_create = false | .pools.test.max_devices = 3' "$ROOT/config.example.json" > "$SIMLEASE_CONFIG"
   printf '%s\n' \
     "SE-1	iPhone SE 1	$SE	$LATEST	Shutdown" \
@@ -216,18 +216,47 @@ test_release_cleans_logs_and_tmp_but_keeps_app_data() {
 }
 
 test_failed_shutdown_is_cleaned_by_a_later_gc() {
+  local rc=0
   set_state SE-1 Booted
   fill_device_folders SE-1
   sl acquire --purpose test >/dev/null
   export STUB_SHUTDOWN_FAIL=1
-  sl release SE-1 2>/dev/null
+  sl release SE-1 2>/dev/null || rc=$?
+  expect "release stays successful after shutdown failure" [ "$rc" = 0 ]
   expect "logs of the still booted device kept" [ -n "$(scratch_files_of SE-1)" ]
   expect "boot marker set for a later sweep" [ -f "$SIMLEASE_STATE_DIR/booted/SE-1" ]
+  rc=0
+  sl gc >/dev/null 2>&1 || rc=$?
+  expect "gc tolerates failed shutdown" [ "$rc" = 0 ]
+  expect "gc keeps the boot marker" [ -f "$SIMLEASE_STATE_DIR/booted/SE-1" ]
+  expect "gc keeps logs of the still booted device" [ -n "$(scratch_files_of SE-1)" ]
   unset STUB_SHUTDOWN_FAIL
   set_state SE-1 Shutdown
   sl gc >/dev/null 2>&1
   expect "gc cleans the device once it is off" [ -z "$(scratch_files_of SE-1)" ]
   expect "boot marker cleared" [ ! -f "$SIMLEASE_STATE_DIR/booted/SE-1" ]
+}
+
+test_release_and_gc_keep_best_effort_after_shutdown_error() {
+  local rc=0
+  sl acquire --purpose test >/dev/null
+  fill_device_folders SE-1
+  export STUB_SHUTDOWN_FAIL_AFTER_STATE=1
+  sl release SE-1 >/dev/null 2>&1 || rc=$?
+  expect "release stays successful after shutdown error" [ "$rc" = 0 ]
+  expect "release cleans device that is off" [ "$(state_of SE-1)" = Shutdown ]
+  expect "release clears boot marker" [ ! -f "$SIMLEASE_STATE_DIR/booted/SE-1" ]
+  expect "release cleans logs and temp files" [ -z "$(scratch_files_of SE-1)" ]
+
+  sl acquire --purpose test >/dev/null
+  rm "$(lease SE-1)"
+  fill_device_folders SE-1
+  rc=0
+  sl gc >/dev/null 2>&1 || rc=$?
+  expect "gc stays successful after shutdown error" [ "$rc" = 0 ]
+  expect "gc cleans device that is off" [ "$(state_of SE-1)" = Shutdown ]
+  expect "gc clears boot marker" [ ! -f "$SIMLEASE_STATE_DIR/booted/SE-1" ]
+  expect "gc cleans logs and temp files" [ -z "$(scratch_files_of SE-1)" ]
 }
 
 test_release_does_not_mark_hand_made_device_for_deletion() {
@@ -335,6 +364,72 @@ test_reclaim_unleased_cleans_device() {
   sl reclaim-unleased --purpose test SE-1 >/dev/null 2>&1
   expect "device shut down" [ "$(state_of SE-1)" = Shutdown ]
   expect "device cleaned" [ -z "$(scratch_files_of SE-1)" ]
+}
+
+test_reclaim_unleased_reports_shutdown_error() {
+  sl acquire --purpose test >/dev/null
+  rm "$(lease SE-1)"
+  fill_device_folders SE-1
+  export STUB_SHUTDOWN_FAIL=1
+  local rc=0
+  sl reclaim-unleased --purpose test SE-1 >"$WORK/out" 2>"$WORK/err" || rc=$?
+  expect "shutdown failure exit code preserved" [ "$rc" = 1 ]
+  expect "device remains booted" [ "$(state_of SE-1)" = Booted ]
+  expect "boot marker retained" [ -f "$SIMLEASE_STATE_DIR/booted/SE-1" ]
+  expect "reclaim lock released" [ ! -d "$SIMLEASE_STATE_DIR/locks/SE-1" ]
+  expect "device data kept" [ -n "$(scratch_files_of SE-1)" ]
+  expect "failure reported" grep -q 'could not shut down SE-1' "$WORK/err"
+  expect "success not reported" test -z "$(grep 'reclaimed unleased' "$WORK/err")"
+}
+
+test_reclaim_unleased_reports_shutdown_timeout() {
+  sl acquire --purpose test >/dev/null
+  rm "$(lease SE-1)"
+  fill_device_folders SE-1
+  export STUB_SHUTDOWN_HANG=1
+  local rc=0
+  SIMLEASE_SIMCTL_TIMEOUT=1 sl reclaim-unleased --purpose test SE-1 >"$WORK/out" 2>"$WORK/err" || rc=$?
+  expect "shutdown timeout exit code preserved" [ "$rc" = 124 ]
+  expect "device remains booted" [ "$(state_of SE-1)" = Booted ]
+  expect "boot marker retained" [ -f "$SIMLEASE_STATE_DIR/booted/SE-1" ]
+  expect "reclaim lock released" [ ! -d "$SIMLEASE_STATE_DIR/locks/SE-1" ]
+  expect "device data kept" [ -n "$(scratch_files_of SE-1)" ]
+  expect "failure reported" grep -q 'could not shut down SE-1' "$WORK/err"
+  expect "success not reported" test -z "$(grep 'reclaimed unleased' "$WORK/err")"
+}
+
+test_reclaim_unleased_reports_shutdown_error_after_state_change() {
+  sl acquire --purpose test >/dev/null
+  rm "$(lease SE-1)"
+  fill_device_folders SE-1
+  export STUB_SHUTDOWN_FAIL_AFTER_STATE=1
+  local rc=0
+  sl reclaim-unleased --purpose test SE-1 >"$WORK/out" 2>"$WORK/err" || rc=$?
+  expect "shutdown error exit code preserved after state change" [ "$rc" = 1 ]
+  expect "device reports Shutdown" [ "$(state_of SE-1)" = Shutdown ]
+  expect "device state checked after shutdown" [ "$(last_line_of 'list devices available -j')" -gt "$(last_line_of 'shutdown SE-1')" ]
+  expect "boot marker retained" [ -f "$SIMLEASE_STATE_DIR/booted/SE-1" ]
+  expect "reclaim lock released" [ ! -d "$SIMLEASE_STATE_DIR/locks/SE-1" ]
+  expect "device data kept" [ -n "$(scratch_files_of SE-1)" ]
+  expect "failure reported" grep -q 'could not shut down SE-1' "$WORK/err"
+  expect "success not reported" test -z "$(grep 'reclaimed unleased' "$WORK/err")"
+}
+
+test_reclaim_unleased_reports_shutdown_timeout_after_state_change() {
+  sl acquire --purpose test >/dev/null
+  rm "$(lease SE-1)"
+  fill_device_folders SE-1
+  export STUB_SHUTDOWN_HANG_AFTER_STATE=1
+  local rc=0
+  SIMLEASE_SIMCTL_TIMEOUT=1 sl reclaim-unleased --purpose test SE-1 >"$WORK/out" 2>"$WORK/err" || rc=$?
+  expect "shutdown timeout exit code preserved after state change" [ "$rc" = 124 ]
+  expect "device reports Shutdown" [ "$(state_of SE-1)" = Shutdown ]
+  expect "device state checked after shutdown" [ "$(last_line_of 'list devices available -j')" -gt "$(last_line_of 'shutdown SE-1')" ]
+  expect "boot marker retained" [ -f "$SIMLEASE_STATE_DIR/booted/SE-1" ]
+  expect "reclaim lock released" [ ! -d "$SIMLEASE_STATE_DIR/locks/SE-1" ]
+  expect "device data kept" [ -n "$(scratch_files_of SE-1)" ]
+  expect "failure reported" grep -q 'could not shut down SE-1' "$WORK/err"
+  expect "success not reported" test -z "$(grep 'reclaimed unleased' "$WORK/err")"
 }
 
 test_acquire_skips_device_that_runs_an_app() {

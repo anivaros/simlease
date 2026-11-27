@@ -4,6 +4,9 @@
 # Every call is appended to $STUB_DIR/calls.log as "simctl <args>".
 # STUB_ERASE_FAIL=<udid> makes `simctl erase` fail for that device.
 # STUB_LIST_FAIL=1 makes every `simctl list` fail.
+# STUB_SHUTDOWN_HANG=1 makes `simctl shutdown` hang until killed.
+# STUB_SHUTDOWN_FAIL_AFTER_STATE=1 transitions to Shutdown, then fails.
+# STUB_SHUTDOWN_HANG_AFTER_STATE=1 transitions to Shutdown, then hangs until killed.
 set -euo pipefail
 
 db="$STUB_DIR/devices.tsv"
@@ -69,6 +72,15 @@ case "$1 ${2:-}" in
     [[ "${STUB_PROBE_FAIL:-}" != "$2" ]]
     ;;
   shutdown\ *)
+    if [[ -n "${STUB_SHUTDOWN_HANG_AFTER_STATE:-}" ]]; then
+      set_state "$2" Shutdown
+      exec sleep 3600
+    fi
+    [[ -z "${STUB_SHUTDOWN_HANG:-}" ]] || exec sleep 3600
+    if [[ -n "${STUB_SHUTDOWN_FAIL_AFTER_STATE:-}" ]]; then
+      set_state "$2" Shutdown
+      exit 1
+    fi
     [[ -z "${STUB_SHUTDOWN_FAIL:-}" ]] || exit 1
     set_state "$2" Shutdown
     ;;

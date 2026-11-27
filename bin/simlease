@@ -594,14 +594,21 @@ clean_device_logs_and_tmp() {
 # Shuts a device down after its lease ends (or it was left unleased) and cleans it.
 # If the shutdown fails, the device gets a boot marker, so the gc sweep tries again.
 shutdown_and_clean_device() {
-  simctl shutdown "$1" >/dev/null 2>&1 || true
-  if [[ "$(device_state "$1")" != "Shutdown" ]]; then
-    echo "simlease: could not shut down $1; gc will try again" >&2
-    mark_booted_by_simlease "$1"
-    return 0
+  local udid="$1" propagate_shutdown_error="${2:-false}" shutdown_rc=0 state
+  simctl shutdown "$udid" >/dev/null 2>&1 || shutdown_rc=$?
+  state="$(device_state "$udid")"
+  if [[ "$propagate_shutdown_error" == true && "$shutdown_rc" != 0 ]]; then
+    echo "simlease: could not shut down $udid; gc will try again" >&2
+    mark_booted_by_simlease "$udid"
+    return "$shutdown_rc"
   fi
-  clear_booted_marker "$1"
-  clean_device_logs_and_tmp "$1"
+  if [[ "$state" != "Shutdown" ]]; then
+    echo "simlease: could not shut down $udid; gc will try again" >&2
+    mark_booted_by_simlease "$udid"
+    return 1
+  fi
+  clear_booted_marker "$udid"
+  clean_device_logs_and_tmp "$udid"
 }
 
 boot_and_probe() {
@@ -1079,11 +1086,11 @@ release_one() {
       # Automated-test pools are owned by the lease for their whole lifecycle.
       # Their configured shutdown policy must clear system services even when a
       # previous lease did not create the booted simulator process.
-      shutdown_and_clean_device "$udid"
+      shutdown_and_clean_device "$udid" || true
       ;;
     restore)
       if simlease_booted_this "$udid"; then
-        shutdown_and_clean_device "$udid"
+        shutdown_and_clean_device "$udid" || true
       else
         echo "simlease: leaving $udid booted; simlease did not boot it" >&2
       fi
@@ -1132,7 +1139,7 @@ cmd_release() {
 }
 
 cmd_reclaim_unleased() {
-  local purpose="" udid=""
+  local purpose="" udid="" shutdown_rc=0
   while (( $# )); do
     case "$1" in
       --purpose) purpose="${2:-}"; shift 2 ;;
@@ -1172,7 +1179,11 @@ cmd_reclaim_unleased() {
     echo "simlease: $udid acquired a lease while reclaiming; leaving it alone" >&2
     exit 4
   fi
-  shutdown_and_clean_device "$udid"
+  shutdown_and_clean_device "$udid" true || shutdown_rc=$?
+  if [[ "$shutdown_rc" != 0 ]]; then
+    drop_lock "$udid"
+    return "$shutdown_rc"
+  fi
   drop_lock "$udid"
   echo "simlease: reclaimed unleased $purpose device $udid" >&2
 }
@@ -1401,7 +1412,7 @@ gc_sweep_unleased_booted() {
         continue
       fi
       echo "simlease: shutting down unleased $sweep_name ($sweep_udid)"
-      shutdown_and_clean_device "$sweep_udid"
+      shutdown_and_clean_device "$sweep_udid" || true
       drop_lock "$sweep_udid"
     done < <(pool_devices_by_name "$sweep_pool")
   done
