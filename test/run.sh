@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs simlease against a fake `xcrun simctl` in a throwaway state directory.
-# Usage: test/run.sh [bash 5 binary]   the default is the bash on PATH
+# Usage: test/run.sh [bash binary]   the default is the bash on PATH
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,15 +20,17 @@ setup() {
   export SIMLEASE_STATE_DIR="$WORK/state"
   export SIMLEASE_CONFIG="$WORK/config.json"
   export SIMLEASE_BOOTSTATUS_TIMEOUT=2
+  export PREP_LOG="$WORK/prep.log"
   export SIMLEASE_RESTART_PAUSE_SECONDS=0
   export SIMLEASE_SIM_DEVICES_DIR="$WORK/devices"
   export SIMLEASE_SIM_LOGS_DIR="$WORK/simlogs"
   mkdir -p "$STUB_DIR" "$WORK/bin"
+  : > "$STUB_DIR/calls.log"
   cp "$ROOT/test/stub/xcrun" "$WORK/bin/xcrun"
   printf '#!/bin/sh\nexit 0\n' > "$WORK/bin/open"
   chmod +x "$WORK/bin/xcrun" "$WORK/bin/open"
   export PATH="$WORK/bin:$ORIGINAL_PATH"
-  unset STUB_BOOTSTATUS_HANG STUB_PROBE_FAIL STUB_SHUTDOWN_FAIL
+  unset STUB_BOOTSTATUS_HANG STUB_PROBE_FAIL STUB_ERASE_FAIL STUB_SHUTDOWN_FAIL STUB_LIST_FAIL SIMLEASE_PREPARE_TIMEOUT
   jq '.pools.test.auto_create = false | .pools.test.max_devices = 3' "$ROOT/config.example.json" > "$SIMLEASE_CONFIG"
   printf '%s\n' \
     "SE-1	iPhone SE 1	$SE	$LATEST	Shutdown" \
@@ -41,7 +43,9 @@ setup() {
     > "$STUB_DIR/devices.tsv"
 }
 
-teardown() { rm -rf "$WORK"; }
+teardown() {
+  rm -rf "$WORK"
+}
 
 sl() { SIMLEASE_SESSION="${OWNER:-me}" "$BASH_BIN" "$ROOT/bin/simlease" "$@"; }
 
@@ -57,6 +61,25 @@ lease() { printf '%s/leases/%s.json' "$SIMLEASE_STATE_DIR" "$1"; }
 age_lease() {
   jq '.heartbeat_at = 1' "$(lease "$1")" > "$WORK/t" && mv "$WORK/t" "$(lease "$1")"
 }
+
+heartbeat_of() { jq .heartbeat_at "$(lease "$1")"; }
+
+edit_config() { jq "$@" "$SIMLEASE_CONFIG" > "$WORK/t" && mv "$WORK/t" "$SIMLEASE_CONFIG"; }
+
+sticky_pool() { edit_config '.pools.test.sticky = true'; }
+
+erase_pool() { edit_config '.pools.test.on_owner_change = "erase"'; }
+
+set_prepare() { edit_config --arg cmd "$1" '.pools.test.prepare = $cmd'; }
+
+# Logs "<event> <udid> <purpose>" and prints noise that must not reach acquire's stdout.
+PREP_RECORDER='echo "$SIMLEASE_POOL_EVENT $SIMLEASE_UDID $SIMLEASE_PURPOSE" >> "$PREP_LOG"; echo noise'
+
+calls_of() { grep -cx "simctl $1" "$STUB_DIR/calls.log" || true; }
+
+last_line_of() { grep -nx "simctl $1" "$STUB_DIR/calls.log" | tail -1 | cut -d: -f1; }
+
+last_owner_of() { cat "$SIMLEASE_STATE_DIR/last/$1"; }
 
 expect() {
   local description="$1"
@@ -91,14 +114,6 @@ test_version_and_help() {
   local rc=0
   sl bogus >/dev/null 2>&1 || rc=$?
   expect "unknown command exits 2" [ "$rc" = 2 ]
-}
-
-test_old_bash_is_refused() {
-  /bin/bash -c '(( BASH_VERSINFO[0] < 5 ))' || return 0
-  local rc=0
-  /bin/bash "$ROOT/bin/simlease" version > "$WORK/old-bash.log" 2>&1 || rc=$?
-  expect "exit 2 under bash 3.2" [ "$rc" = 2 ]
-  expect "says how to fix it" grep -q 'brew install bash' "$WORK/old-bash.log"
 }
 
 test_missing_config_is_a_config_error() {
@@ -485,6 +500,470 @@ test_bad_arguments_fail_before_leasing() {
   sl acquire --purpose nope >/dev/null 2>&1 || rc=$?
   expect "unknown pool exits 2" [ "$rc" = 2 ]
   expect "nothing booted" [ "$(state_of SE-1)" = Shutdown ]
+}
+
+test_sticky_prefers_last_owner() {
+  sticky_pool
+  expect "a gets SE 1" [ "$(OWNER=a sl acquire --purpose test)" = SE-1 ]
+  OWNER=a sl release SE-1
+  expect "last owner recorded" [ "$(last_owner_of SE-1)" = a ]
+  expect "b gets a device nobody used" [ "$(OWNER=b sl acquire --purpose test)" = SE-2 ]
+  expect "a gets its device back" [ "$(OWNER=a sl acquire --purpose test)" = SE-1 ]
+}
+
+test_sticky_handover_notes_previous_owner() {
+  sticky_pool
+  edit_config '.pools.test.max_devices = 1'
+  OWNER=a sl acquire --purpose test >/dev/null 2>"$WORK/first.err"
+  expect "no note for a never-used device" [ "$(grep -c 'used it before' "$WORK/first.err")" = 0 ]
+  OWNER=a sl release SE-1
+  OWNER=a sl acquire --purpose test >/dev/null 2>"$WORK/own.err"
+  expect "no note for the same owner" [ "$(grep -c 'used it before' "$WORK/own.err")" = 0 ]
+  OWNER=a sl release SE-1
+  expect "b gets a's device" [ "$(OWNER=b sl acquire --purpose test 2>"$WORK/other.err")" = SE-1 ]
+  expect "b is told who used it" grep -q 'SE-1) is yours now. a used it before and no longer holds it' "$WORK/other.err"
+  expect "nothing was erased" [ "$(calls_of 'erase SE-1')" = 0 ]
+}
+
+test_sticky_takes_the_least_recently_used_device_of_other_owners() {
+  sticky_pool
+  edit_config '.pools.test.max_devices = 2'
+  expect "a gets SE 1" [ "$(OWNER=a sl acquire --purpose test)" = SE-1 ]
+  expect "b gets SE 2" [ "$(OWNER=b sl acquire --purpose test)" = SE-2 ]
+  OWNER=a sl release SE-1
+  OWNER=b sl release SE-2
+  touch -t 202601010000 "$SIMLEASE_STATE_DIR/last/SE-2"
+  expect "c gets the device that was used longest ago" [ "$(OWNER=c sl acquire --purpose test 2>/dev/null)" = SE-2 ]
+  OWNER=c sl release SE-2
+  touch -t 202601010000 "$SIMLEASE_STATE_DIR/last/SE-1"
+  expect "d gets the other one once it is the older" [ "$(OWNER=d sl acquire --purpose test 2>/dev/null)" = SE-1 ]
+}
+
+test_heartbeat_counts_as_use() {
+  sticky_pool
+  OWNER=a sl acquire --purpose test >/dev/null
+  touch -t 202601010000 "$SIMLEASE_STATE_DIR/last/SE-1"
+  OWNER=a sl heartbeat SE-1
+  expect "last use is refreshed" [ "$(stat -f %m "$SIMLEASE_STATE_DIR/last/SE-1")" -gt "$(date -j -f %Y%m%d%H%M 202601020000 +%s)" ]
+}
+
+test_sticky_same_owner_reacquire_returns_same_device() {
+  sticky_pool
+  OWNER=a sl acquire --purpose test >/dev/null
+  expect "same device again" [ "$(OWNER=a sl acquire --purpose test)" = SE-1 ]
+  expect "exactly one lease" [ "$(ls "$SIMLEASE_STATE_DIR/leases" | wc -l | tr -d ' ')" = 1 ]
+  set_state SE-1 Shutdown
+  expect "shut-down held device comes back" [ "$(OWNER=a sl acquire --purpose test)" = SE-1 ]
+  expect "and is booted again" [ "$(state_of SE-1)" = Booted ]
+  expect "still one lease" [ "$(ls "$SIMLEASE_STATE_DIR/leases" | wc -l | tr -d ' ')" = 1 ]
+}
+
+test_sticky_reacquire_refreshes_heartbeat() {
+  sticky_pool
+  OWNER=a sl acquire --purpose test >/dev/null
+  age_lease SE-1
+  expect "expired own lease: same device" [ "$(OWNER=a sl acquire --purpose test)" = SE-1 ]
+  expect "heartbeat refreshed" [ "$(heartbeat_of SE-1)" -gt 1 ]
+}
+
+test_sticky_expired_lease_returns_same_device_without_erase() {
+  sticky_pool
+  erase_pool
+  OWNER=a sl acquire --purpose test >/dev/null
+  age_lease SE-1
+  expect "same device after expiry" [ "$(OWNER=a sl acquire --purpose test)" = SE-1 ]
+  OWNER=a sl release SE-1
+  expect "same device after release" [ "$(OWNER=a sl acquire --purpose test)" = SE-1 ]
+  expect "erased only on first use" [ "$(calls_of 'erase SE-1')" = 1 ]
+}
+
+test_non_sticky_pool_unchanged() {
+  OWNER=a sl acquire --purpose test >/dev/null
+  OWNER=a sl release SE-1
+  expect "b gets SE 1 as before" [ "$(OWNER=b sl acquire --purpose test)" = SE-1 ]
+  expect "a second acquire leases another device" [ "$(OWNER=b sl acquire --purpose test)" = SE-2 ]
+  expect "nothing erased" [ "$(grep -c ' erase ' "$STUB_DIR/calls.log" || true)" = 0 ]
+}
+
+test_owner_change_erases() {
+  erase_pool
+  edit_config '.pools.test.max_devices = 1'
+  OWNER=a sl acquire --purpose test >/dev/null
+  OWNER=a sl release SE-1
+  expect "b gets the only device" [ "$(OWNER=b sl acquire --purpose test)" = SE-1 ]
+  expect "erased for a and again for b" [ "$(calls_of 'erase SE-1')" = 2 ]
+  expect "erase before the last boot" [ "$(last_line_of 'erase SE-1')" -lt "$(last_line_of 'boot SE-1')" ]
+  OWNER=b sl release SE-1
+  OWNER=b sl acquire --purpose test >/dev/null
+  expect "no erase when the owner is the same" [ "$(calls_of 'erase SE-1')" = 2 ]
+}
+
+test_owner_change_first_use_erases() {
+  erase_pool
+  set_state SE-1 Booted
+  expect "first device" [ "$(sl acquire --purpose test)" = SE-1 ]
+  expect "erased on first use" [ "$(calls_of 'erase SE-1')" = 1 ]
+  expect "booted after the erase" [ "$(state_of SE-1)" = Booted ]
+  expect "lease records a fresh boot" [ "$(jq -r .was_booted "$(lease SE-1)")" = false ]
+}
+
+test_busy_device_not_erased() {
+  erase_pool
+  OWNER=a sl acquire --purpose test >/dev/null
+  OWNER=a sl release SE-1
+  fake_ps "/Users/x/Library/Developer/CoreSimulator/Devices/SE-1/data/Containers/Bundle/Application/A/App.app/App"
+  expect "b skips the device with a running app" [ "$(OWNER=b sl acquire --purpose test)" = SE-2 ]
+  expect "busy device not erased again" [ "$(calls_of 'erase SE-1')" = 1 ]
+  expect "the device b got was erased for b" [ "$(calls_of 'erase SE-2')" = 1 ]
+  expect "no lease on the busy device" [ ! -f "$(lease SE-1)" ]
+}
+
+test_erase_failure_skips_device() {
+  erase_pool
+  export STUB_ERASE_FAIL=SE-1
+  expect "next device" [ "$(sl acquire --purpose test)" = SE-2 ]
+  expect "erase of SE 1 was attempted" [ "$(calls_of 'erase SE-1')" = 1 ]
+  expect "no lease on SE 1" [ ! -f "$(lease SE-1)" ]
+  expect "no locks left behind" [ -z "$(ls "$SIMLEASE_STATE_DIR/locks")" ]
+}
+
+test_prepare_runs_after_erase() {
+  sticky_pool
+  erase_pool
+  set_prepare "$PREP_RECORDER"
+  expect "only the UDID on stdout" [ "$(OWNER=a sl acquire --purpose test)" = SE-1 ]
+  expect "prepare saw the erase" [ "$(cat "$PREP_LOG")" = "erased SE-1 test" ]
+  OWNER=a sl acquire --purpose test >/dev/null
+  OWNER=a sl release SE-1
+  OWNER=a sl acquire --purpose test >/dev/null
+  expect "prepare ran once" [ "$(wc -l < "$PREP_LOG" | tr -d ' ')" = 1 ]
+}
+
+test_prepare_runs_after_create() {
+  erase_pool
+  set_prepare "$PREP_RECORDER"
+  edit_config '.pools.test.auto_create = true | .pools.test.max_devices = 4'
+  sl acquire --purpose test --count 3 >/dev/null
+  local created
+  created="$(awk -F'\t' '$2 == "iPhone SE 3" { print $1 }' "$STUB_DIR/devices.tsv")"
+  expect "a device was created" [ -n "$created" ]
+  expect "prepare saw the creation" grep -qx "created $created test" "$PREP_LOG"
+  expect "created device not erased" [ "$(calls_of "erase $created")" = 0 ]
+  expect "existing device prepared after its erase" grep -qx "erased SE-1 test" "$PREP_LOG"
+  expect "fresh marker consumed" [ ! -e "$SIMLEASE_STATE_DIR/fresh/$created" ]
+}
+
+test_prepare_failure_is_not_fatal() {
+  erase_pool
+  set_prepare 'echo boom >&2; exit 7'
+  local out
+  out="$(sl acquire --purpose test 2>"$WORK/err")"
+  expect "acquired anyway" [ "$out" = SE-1 ]
+  expect "warning printed" grep -q 'prepare failed for SE-1 (exit 7); continuing' "$WORK/err"
+  expect "lease written" [ -f "$(lease SE-1)" ]
+  expect "no locks left behind" [ -z "$(ls "$SIMLEASE_STATE_DIR/locks")" ]
+}
+
+test_prepare_timeout_is_not_fatal() {
+  erase_pool
+  set_prepare 'sleep 30'
+  export SIMLEASE_PREPARE_TIMEOUT=1
+  local out start="$SECONDS"
+  out="$(sl acquire --purpose test 2>"$WORK/err")"
+  expect "acquired anyway" [ "$out" = SE-1 ]
+  expect "timeout reported" grep -q 'prepare failed for SE-1 (exit 124)' "$WORK/err"
+  expect "did not wait for the hung command" [ $(( SECONDS - start )) -lt 15 ]
+  expect "no locks left behind" [ -z "$(ls "$SIMLEASE_STATE_DIR/locks")" ]
+}
+
+test_invalid_sticky_config_is_a_config_error() {
+  edit_config '.pools.test.on_owner_change = "wipe"'
+  local rc=0
+  sl acquire --purpose test >/dev/null 2>&1 || rc=$?
+  expect "exit 2" [ "$rc" = 2 ]
+  expect "nothing booted" [ "$(state_of SE-1)" = Shutdown ]
+}
+
+test_heartbeat_all_mine() {
+  OWNER=a sl acquire --purpose test --count 2 >/dev/null
+  OWNER=b sl acquire --purpose visual >/dev/null
+  age_lease SE-1
+  age_lease SE-2
+  age_lease PRO-1
+  expect "prints nothing" [ -z "$(OWNER=a sl heartbeat --all-mine 2>&1)" ]
+  expect "SE 1 refreshed" [ "$(heartbeat_of SE-1)" -gt 1 ]
+  expect "SE 2 refreshed" [ "$(heartbeat_of SE-2)" -gt 1 ]
+  expect "other session untouched" [ "$(heartbeat_of PRO-1)" = 1 ]
+  age_lease SE-1
+  OWNER=a sl heartbeat --all-mine --purpose visual
+  expect "purpose filter respected" [ "$(heartbeat_of SE-1)" = 1 ]
+  expect "no leases: silent success" [ -z "$(OWNER=nobody sl heartbeat --all-mine 2>&1)" ]
+}
+
+test_status_mine_prints_udids() {
+  expect "nothing leased: empty" [ -z "$(OWNER=a sl status --mine --print udid)" ]
+  OWNER=a sl acquire --purpose test --count 2 >/dev/null
+  OWNER=b sl acquire --purpose visual >/dev/null
+  expect "a's devices" [ "$(OWNER=a sl status --mine --print udid)" = "SE-1
+SE-2" ]
+  expect "purpose filter" [ -z "$(OWNER=a sl status --mine --print udid --purpose visual)" ]
+  expect "b's device" [ "$(OWNER=b sl status --mine --print udid)" = PRO-1 ]
+  age_lease PRO-1
+  expect "stale lease not printed" [ -z "$(OWNER=b sl status --mine --print udid)" ]
+  OWNER=a sl status --mine > "$WORK/table"
+  expect "table shows mine" grep -q '^SE-1 ' "$WORK/table"
+  expect "table hides others" [ -z "$(grep '^PRO-1 ' "$WORK/table" || true)" ]
+}
+
+test_last_owner_survives_release_and_gc() {
+  OWNER=a sl acquire --purpose test >/dev/null
+  OWNER=a sl release SE-1
+  sl gc >/dev/null 2>&1
+  expect "last owner kept" [ "$(last_owner_of SE-1)" = a ]
+  awk -F'\t' '$1 != "SE-1"' "$STUB_DIR/devices.tsv" > "$STUB_DIR/t"
+  mv "$STUB_DIR/t" "$STUB_DIR/devices.tsv"
+  sl gc >/dev/null 2>&1
+  expect "dropped once the device is gone" [ ! -f "$SIMLEASE_STATE_DIR/last/SE-1" ]
+}
+
+hold_lock() {
+  mkdir -p "$SIMLEASE_STATE_DIR/locks/$1"
+  printf '%s\n%s\nother\n%s\n' "$$" "$(date +%s)" "${2:-}" > "$SIMLEASE_STATE_DIR/locks/$1/meta"
+}
+
+test_capacity_block_does_not_erase_or_hand_over() {
+  sticky_pool
+  erase_pool
+  edit_config '.pools.test.max_devices = 1'
+  OWNER=a sl acquire --purpose test >/dev/null
+  OWNER=a sl release SE-1
+  hold_lock boot-capacity lifecycle
+  local rc=0
+  OWNER=b sl acquire --purpose test >/dev/null 2>"$WORK/err" || rc=$?
+  expect "exit 3 while another session boots" [ "$rc" = 3 ]
+  expect "not erased for b" [ "$(calls_of 'erase SE-1')" = 1 ]
+  expect "last owner unchanged" [ "$(last_owner_of SE-1)" = a ]
+  rm -rf "$SIMLEASE_STATE_DIR/locks/boot-capacity"
+  edit_config '.guards.max_booted_devices = 0'
+  rc=0
+  OWNER=b sl acquire --purpose test >/dev/null 2>>"$WORK/err" || rc=$?
+  expect "exit 3 at the boot limit" [ "$rc" = 3 ]
+  expect "still not erased for b" [ "$(calls_of 'erase SE-1')" = 1 ]
+  expect "no lease" [ ! -f "$(lease SE-1)" ]
+}
+
+test_handover_note_only_after_the_lease() {
+  sticky_pool
+  edit_config '.pools.test.max_devices = 1'
+  OWNER=a sl acquire --purpose test >/dev/null
+  OWNER=a sl release SE-1
+  edit_config '.guards.max_booted_devices = 0'
+  OWNER=b sl acquire --purpose test >/dev/null 2>"$WORK/err" || true
+  expect "no note when nothing was handed over" [ "$(grep -c 'is yours now' "$WORK/err")" = 0 ]
+}
+
+test_boot_queue_hint_matches_wait() {
+  hold_lock boot-capacity lifecycle
+  sl acquire --purpose test >/dev/null 2>"$WORK/nowait.err" || true
+  expect "without --wait: suggests it" grep -q 'pass --wait' "$WORK/nowait.err"
+  sl acquire --purpose test --wait 12 >/dev/null 2>"$WORK/wait.err" || true
+  expect "with --wait: no suggestion" [ "$(grep -c 'pass --wait' "$WORK/wait.err")" = 0 ]
+  expect "with --wait: one waiting line" [ "$(grep -c 'waiting for it' "$WORK/wait.err")" = 1 ]
+}
+
+test_prepare_timeout_stops_the_hooks_children() {
+  erase_pool
+  set_prepare "(sleep 3; echo late > '$WORK/late') & sleep 30"
+  export SIMLEASE_PREPARE_TIMEOUT=1
+  expect "acquired anyway" [ "$(sl acquire --purpose test 2>/dev/null)" = SE-1 ]
+  sleep 4
+  expect "the child did not outlive the timeout" [ ! -e "$WORK/late" ]
+}
+
+test_prepare_children_stop_when_the_hook_returns() {
+  erase_pool
+  set_prepare "(sleep 2; echo late > '$WORK/late') >/dev/null 2>&1 &"
+  expect "acquired" [ "$(sl acquire --purpose test 2>/dev/null)" = SE-1 ]
+  sleep 3
+  expect "no background work after the hand-over" [ ! -e "$WORK/late" ]
+}
+
+test_sticky_reuse_of_booted_device_ignores_boot_queue() {
+  sticky_pool
+  OWNER=a sl acquire --purpose test >/dev/null
+  hold_lock boot-capacity lifecycle
+  expect "booted device comes back at once" [ "$(OWNER=a sl acquire --purpose test)" = SE-1 ]
+  set_state SE-1 Shutdown
+  local rc=0
+  OWNER=a sl acquire --purpose test >/dev/null 2>"$WORK/err" || rc=$?
+  expect "a boot still queues" [ "$rc" = 3 ]
+  expect "and says why" grep -q 'another session is booting' "$WORK/err"
+}
+
+test_sticky_reuse_drops_device_that_left_the_pool() {
+  sticky_pool
+  OWNER=a sl acquire --purpose test >/dev/null
+  sed 's/^SE-1	iPhone SE 1	/SE-1	Renamed 1	/' "$STUB_DIR/devices.tsv" > "$STUB_DIR/t" && mv "$STUB_DIR/t" "$STUB_DIR/devices.tsv"
+  expect "gets a device of the pool" [ "$(OWNER=a sl acquire --purpose test 2>"$WORK/err")" = SE-2 ]
+  expect "says why" grep -q 'no longer in pool' "$WORK/err"
+  expect "old lease released" [ ! -f "$(lease SE-1)" ]
+}
+
+test_gc_keeps_marker_being_written() {
+  : > "$SIMLEASE_STATE_DIR/last/SE-1.tmp.4242" 2>/dev/null || { mkdir -p "$SIMLEASE_STATE_DIR/last"; : > "$SIMLEASE_STATE_DIR/last/SE-1.tmp.4242"; }
+  : > "$SIMLEASE_STATE_DIR/last/GONE"
+  sl gc >/dev/null 2>&1
+  expect "in-flight temp file kept" [ -e "$SIMLEASE_STATE_DIR/last/SE-1.tmp.4242" ]
+  expect "marker of a deleted device removed" [ ! -e "$SIMLEASE_STATE_DIR/last/GONE" ]
+}
+
+test_unknown_purpose_fails_for_heartbeat_and_status() {
+  local rc=0
+  sl heartbeat --all-mine --purpose tset >/dev/null 2>&1 || rc=$?
+  expect "heartbeat exits 2" [ "$rc" = 2 ]
+  rc=0
+  sl status --purpose tset >/dev/null 2>&1 || rc=$?
+  expect "status exits 2" [ "$rc" = 2 ]
+}
+
+test_heartbeat_all_mine_reports_locked_lease() {
+  OWNER=a sl acquire --purpose test >/dev/null
+  age_lease SE-1
+  hold_lock SE-1 lifecycle
+  local rc=0
+  OWNER=a sl heartbeat --all-mine 2>"$WORK/err" || rc=$?
+  expect "exit 4" [ "$rc" = 4 ]
+  expect "names the device" grep -q 'SE-1 is locked right now' "$WORK/err"
+  expect "lease not extended" [ "$(heartbeat_of SE-1)" = 1 ]
+}
+
+test_sticky_must_be_a_boolean() {
+  edit_config '.pools.test.sticky = "true"'
+  local rc=0
+  sl acquire --purpose test >/dev/null 2>&1 || rc=$?
+  expect "exit 2" [ "$rc" = 2 ]
+}
+
+test_gc_gives_running_app_a_second_ttl() {
+  local app="/Users/x/Library/Developer/CoreSimulator/Devices/SE-1/data/Containers/Bundle/Application/A/App.app/App" ttl
+  OWNER=a sl acquire --purpose test >/dev/null
+  ttl="$(jq -r '.pools.test.lease_ttl_seconds // 1200' "$SIMLEASE_CONFIG")"
+  jq --argjson at "$(( $(date +%s) - ttl - 60 ))" '.heartbeat_at = $at' "$(lease SE-1)" > "$WORK/t" && mv "$WORK/t" "$(lease SE-1)"
+  fake_ps "$app"
+  sl gc >/dev/null 2>&1
+  expect "stale lease kept while the app runs" [ -f "$(lease SE-1)" ]
+  jq --argjson at "$(( $(date +%s) - ttl * 2 - 60 ))" '.heartbeat_at = $at' "$(lease SE-1)" > "$WORK/t" && mv "$WORK/t" "$(lease SE-1)"
+  sl gc >/dev/null 2>&1
+  expect "reclaimed after twice the TTL" [ ! -f "$(lease SE-1)" ]
+  OWNER=b sl acquire --purpose test >/dev/null
+  jq --argjson at "$(( $(date +%s) - ttl - 60 ))" '.heartbeat_at = $at' "$(lease SE-2)" > "$WORK/t" && mv "$WORK/t" "$(lease SE-2)"
+  sl gc >/dev/null 2>&1
+  expect "no app: reclaimed after one TTL" [ ! -f "$(lease SE-2)" ]
+}
+
+APP_ON_SE1="/Users/x/Library/Developer/CoreSimulator/Devices/SE-1/data/Containers/Bundle/Application/A/App.app/App"
+
+test_sticky_reuse_keeps_device_when_the_listing_fails() {
+  sticky_pool
+  OWNER=a sl acquire --purpose test >/dev/null
+  local rc=0
+  STUB_LIST_FAIL=1 OWNER=a sl acquire --purpose test >/dev/null 2>"$WORK/err" || rc=$?
+  expect "exit 3" [ "$rc" = 3 ]
+  expect "lease kept" [ -f "$(lease SE-1)" ]
+  expect "device not shut down" [ "$(calls_of 'shutdown SE-1')" = 0 ]
+  expect "still booted" [ "$(state_of SE-1)" = Booted ]
+}
+
+test_sticky_reuse_does_not_probe_a_busy_device() {
+  sticky_pool
+  OWNER=a sl acquire --purpose test >/dev/null
+  fake_ps "$APP_ON_SE1"
+  export STUB_PROBE_FAIL=SE-1
+  expect "busy device comes back as it is" [ "$(OWNER=a sl acquire --purpose test)" = SE-1 ]
+  expect "not restarted" [ "$(calls_of 'shutdown SE-1')" = 0 ]
+  expect "lease kept" [ -f "$(lease SE-1)" ]
+}
+
+test_sticky_reuse_restarts_an_idle_device_only_under_the_boot_lock() {
+  sticky_pool
+  OWNER=a sl acquire --purpose test >/dev/null
+  export STUB_PROBE_FAIL=SE-1
+  hold_lock boot-capacity lifecycle
+  local rc=0
+  OWNER=a sl acquire --purpose test >/dev/null 2>"$WORK/err" || rc=$?
+  expect "queues behind the other boot" [ "$rc" = 3 ]
+  expect "not restarted without the lock" [ "$(calls_of 'shutdown SE-1')" = 0 ]
+  expect "lease kept" [ -f "$(lease SE-1)" ]
+}
+
+test_sticky_stale_own_lease_with_running_app_returns_same_device() {
+  sticky_pool
+  erase_pool
+  OWNER=a sl acquire --purpose test >/dev/null
+  age_lease SE-1
+  fake_ps "$APP_ON_SE1"
+  expect "own device, not a second one" [ "$(OWNER=a sl acquire --purpose test)" = SE-1 ]
+  expect "exactly one lease" [ "$(ls "$SIMLEASE_STATE_DIR/leases" | wc -l | tr -d ' ')" = 1 ]
+  expect "heartbeat refreshed" [ "$(heartbeat_of SE-1)" -gt 1 ]
+  expect "nothing else erased" [ "$(calls_of 'erase SE-2')" = 0 ]
+}
+
+test_erase_path_keeps_boot_marker_when_shutdown_fails() {
+  erase_pool
+  set_state SE-1 Booted
+  export STUB_SHUTDOWN_FAIL=1
+  expect "skips the device it could not shut down" [ "$(sl acquire --purpose test 2>"$WORK/err")" = SE-2 ]
+  expect "SE 1 not erased while booted" [ "$(calls_of 'erase SE-1')" = 0 ]
+  expect "boot marker left for gc" [ -f "$SIMLEASE_STATE_DIR/booted/SE-1" ]
+  expect "says so" grep -q 'could not shut down iPhone SE 1' "$WORK/err"
+}
+
+test_failed_boot_after_erase_forgets_the_last_owner() {
+  sticky_pool
+  erase_pool
+  set_prepare "$PREP_RECORDER"
+  edit_config '.pools.test.max_devices = 1'
+  OWNER=a sl acquire --purpose test >/dev/null
+  OWNER=a sl release SE-1
+  local rc=0
+  STUB_PROBE_FAIL=SE-1 OWNER=b sl acquire --purpose test >/dev/null 2>&1 || rc=$?
+  expect "b did not get the device" [ "$rc" = 3 ]
+  expect "last owner forgotten" [ ! -e "$SIMLEASE_STATE_DIR/last/SE-1" ]
+  expect "a gets it back" [ "$(OWNER=a sl acquire --purpose test 2>/dev/null)" = SE-1 ]
+  expect "erased for a, for b and again for a" [ "$(calls_of 'erase SE-1')" = 3 ]
+  expect "prepared each time" [ "$(wc -l < "$PREP_LOG" | tr -d ' ')" = 3 ]
+}
+
+start_acquire_with_slow_hook() {
+  erase_pool
+  set_prepare "sleep 3; echo late > '$WORK/late'"
+  SIMLEASE_SESSION=me "$BASH_BIN" "$ROOT/bin/simlease" acquire --purpose test >/dev/null 2>&1 &
+  ACQUIRE_PID=$!
+  local tries=0
+  until grep -qx 'simctl erase SE-1' "$STUB_DIR/calls.log" || (( tries >= 50 )); do
+    sleep 0.1
+    tries=$(( tries + 1 ))
+  done
+  sleep 0.5
+}
+
+test_prepare_hook_stops_when_simlease_is_killed() {
+  start_acquire_with_slow_hook
+  kill -KILL "$ACQUIRE_PID"
+  wait "$ACQUIRE_PID" 2>/dev/null || true
+  sleep 4
+  expect "the hook did not outlive simlease" [ ! -e "$WORK/late" ]
+}
+
+test_prepare_hook_stops_on_hangup() {
+  start_acquire_with_slow_hook
+  kill -HUP "$ACQUIRE_PID"
+  local rc=0
+  wait "$ACQUIRE_PID" 2>/dev/null || rc=$?
+  sleep 4
+  expect "exit 129" [ "$rc" = 129 ]
+  expect "the hook stopped" [ ! -e "$WORK/late" ]
+  expect "no locks left behind" [ -z "$(ls "$SIMLEASE_STATE_DIR/locks")" ]
 }
 
 install_copy() {
