@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Fake `xcrun simctl` backed by $STUB_DIR/devices.tsv:
 # udid <TAB> name <TAB> device type identifier <TAB> runtime <TAB> state
+# Every call is appended to $STUB_DIR/calls.log as "simctl <args>".
+# STUB_ERASE_FAIL=<udid> makes `simctl erase` fail for that device.
+# STUB_LIST_FAIL=1 makes every `simctl list` fail.
+# STUB_SHUTDOWN_HANG=1 makes `simctl shutdown` hang until killed.
+# STUB_SHUTDOWN_FAIL_AFTER_STATE=1 transitions to Shutdown, then fails.
+# STUB_SHUTDOWN_HANG_AFTER_STATE=1 transitions to Shutdown, then hangs until killed.
 set -euo pipefail
 
 db="$STUB_DIR/devices.tsv"
@@ -9,6 +15,8 @@ printf '%s\n' "$*" >> "$STUB_DIR/calls.log"
 
 [[ "${1:-}" == simctl ]] || { echo "stub xcrun: only simctl is supported" >&2; exit 64; }
 shift
+
+[[ "${1:-}" != list || -z "${STUB_LIST_FAIL:-}" ]] || { echo "stub xcrun: list failed" >&2; exit 1; }
 
 type_id() {
   case "$1" in
@@ -64,7 +72,23 @@ case "$1 ${2:-}" in
     [[ "${STUB_PROBE_FAIL:-}" != "$2" ]]
     ;;
   shutdown\ *)
+    if [[ -n "${STUB_SHUTDOWN_HANG_AFTER_STATE:-}" ]]; then
+      set_state "$2" Shutdown
+      exec sleep 3600
+    fi
+    [[ -z "${STUB_SHUTDOWN_HANG:-}" ]] || exec sleep 3600
+    if [[ -n "${STUB_SHUTDOWN_FAIL_AFTER_STATE:-}" ]]; then
+      set_state "$2" Shutdown
+      exit 1
+    fi
+    [[ -z "${STUB_SHUTDOWN_FAIL:-}" ]] || exit 1
     set_state "$2" Shutdown
+    ;;
+  erase\ *)
+    has_device "$2" || exit 1
+    [[ "${STUB_ERASE_FAIL:-}" != "$2" ]] || { echo "stub xcrun: erase failed" >&2; exit 1; }
+    state="$(awk -F'\t' -v udid="$2" '$1 == udid { print $5 }' "$db")"
+    [[ "$state" == Shutdown ]] || { echo "Unable to erase contents and settings in current state: $state" >&2; exit 149; }
     ;;
   create\ *)
     udid="$(uuidgen)"
