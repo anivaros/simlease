@@ -717,8 +717,14 @@ release_one() {
     drop_corrupt_lease "$file"
     return 0
   fi
+  # force: false releases only this session's lease; true releases any lease;
+  # stale (from gc) releases any lease that is still stale under the lock.
+  case "$force" in
+    true|false|stale) ;;
+    *) echo "simlease: internal error: release_one force=$force" >&2; return 2 ;;
+  esac
   owner="$(lease_field "$udid" owner unknown)"
-  if [[ "$force" != true && "$owner" != "$(session_id)" ]]; then
+  if [[ "$force" == false && "$owner" != "$(session_id)" ]]; then
     echo "simlease: $udid is leased by $owner; use --force only when that session is gone" >&2
     return 1
   fi
@@ -731,6 +737,13 @@ release_one() {
   if [[ ! -f "$file" ]] || [[ "$(lease_field "$udid" acquired_at 0)" != "$acquired_at" ]]; then
     drop_lock "$udid"
     echo "simlease: the lease for $udid changed while releasing; leaving the new lease alone" >&2
+    return 1
+  fi
+  # gc checked the lease without this lock. A heartbeat or a new acquire since then
+  # keeps it. heartbeat takes no lock, so one that lands after this check is still lost.
+  if [[ "$force" == stale ]] && lease_is_live "$udid"; then
+    drop_lock "$udid"
+    echo "simlease: the lease for $udid is live again (heartbeat or new acquire); keeping it" >&2
     return 1
   fi
 
@@ -961,7 +974,7 @@ gc_reclaim_stale_leases() {
     fi
     drop_lock "$udid"
     echo "simlease: reclaiming the stale lease for $udid ($purpose)"
-    release_one "$udid" true || true
+    release_one "$udid" stale || true
   done
 }
 
