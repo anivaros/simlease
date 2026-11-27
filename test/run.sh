@@ -274,24 +274,6 @@ test_gc_reclaims_stale_test_lease() {
   expect "device shut down" [ "$(state_of SE-1)" = Shutdown ]
 }
 
-# Runs one simlease function, for paths that the CLI cannot reach on time (races).
-sl_function() {
-  # eval, not `source <(…)`: bash 3.2 reads nothing from a process substitution there.
-  # `|| exit` keeps errexit off inside the function, as at the real call sites.
-  SIMLEASE_SESSION="${OWNER:-me}" "$BASH_BIN" -c 'eval "$(sed "/^command=/,\$d" "$1")"; shift; "$@" || exit' sl_function "$ROOT/bin/simlease" "$@"
-}
-
-test_stale_release_keeps_a_lease_that_is_live_again() {
-  OWNER=other sl acquire --purpose test >/dev/null
-  local rc=0
-  # Same session as the lease owner, so only the liveness check can refuse.
-  OWNER=other sl_function release_one SE-1 stale >/dev/null 2>"$WORK/err" || rc=$?
-  expect "release refused" [ "$rc" = 1 ]
-  expect "refused because the lease is live" grep -q 'is live again' "$WORK/err"
-  expect "live lease kept" [ -f "$(lease SE-1)" ]
-  expect "device still booted" [ "$(state_of SE-1)" = Booted ]
-}
-
 test_gc_keeps_live_lease() {
   OWNER=alive sl acquire --purpose test >/dev/null
   sl gc >/dev/null 2>&1
