@@ -3,6 +3,7 @@
 # udid <TAB> name <TAB> device type identifier <TAB> runtime <TAB> state
 # Every call is appended to $STUB_DIR/calls.log as "simctl <args>".
 # STUB_ERASE_FAIL=<udid> makes `simctl erase` fail for that device.
+# STUB_LIST_FAIL=1 makes every `simctl list` fail.
 set -euo pipefail
 
 db="$STUB_DIR/devices.tsv"
@@ -11,6 +12,8 @@ printf '%s\n' "$*" >> "$STUB_DIR/calls.log"
 
 [[ "${1:-}" == simctl ]] || { echo "stub xcrun: only simctl is supported" >&2; exit 64; }
 shift
+
+[[ "${1:-}" != list || -z "${STUB_LIST_FAIL:-}" ]] || { echo "stub xcrun: list failed" >&2; exit 1; }
 
 type_id() {
   case "$1" in

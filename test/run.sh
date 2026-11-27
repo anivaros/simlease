@@ -30,7 +30,7 @@ setup() {
   printf '#!/bin/sh\nexit 0\n' > "$WORK/bin/open"
   chmod +x "$WORK/bin/xcrun" "$WORK/bin/open"
   export PATH="$WORK/bin:$ORIGINAL_PATH"
-  unset STUB_BOOTSTATUS_HANG STUB_PROBE_FAIL STUB_ERASE_FAIL STUB_SHUTDOWN_FAIL SIMLEASE_PREPARE_TIMEOUT
+  unset STUB_BOOTSTATUS_HANG STUB_PROBE_FAIL STUB_ERASE_FAIL STUB_SHUTDOWN_FAIL STUB_LIST_FAIL SIMLEASE_PREPARE_TIMEOUT
   jq '.pools.test.auto_create = false | .pools.test.max_devices = 3' "$ROOT/config.example.json" > "$SIMLEASE_CONFIG"
   printf '%s\n' \
     "SE-1	iPhone SE 1	$SE	$LATEST	Shutdown" \
@@ -859,6 +859,111 @@ test_gc_gives_running_app_a_second_ttl() {
   jq --argjson at "$(( $(date +%s) - ttl - 60 ))" '.heartbeat_at = $at' "$(lease SE-2)" > "$WORK/t" && mv "$WORK/t" "$(lease SE-2)"
   sl gc >/dev/null 2>&1
   expect "no app: reclaimed after one TTL" [ ! -f "$(lease SE-2)" ]
+}
+
+APP_ON_SE1="/Users/x/Library/Developer/CoreSimulator/Devices/SE-1/data/Containers/Bundle/Application/A/App.app/App"
+
+test_sticky_reuse_keeps_device_when_the_listing_fails() {
+  sticky_pool
+  OWNER=a sl acquire --purpose test >/dev/null
+  local rc=0
+  STUB_LIST_FAIL=1 OWNER=a sl acquire --purpose test >/dev/null 2>"$WORK/err" || rc=$?
+  expect "exit 3" [ "$rc" = 3 ]
+  expect "lease kept" [ -f "$(lease SE-1)" ]
+  expect "device not shut down" [ "$(calls_of 'shutdown SE-1')" = 0 ]
+  expect "still booted" [ "$(state_of SE-1)" = Booted ]
+}
+
+test_sticky_reuse_does_not_probe_a_busy_device() {
+  sticky_pool
+  OWNER=a sl acquire --purpose test >/dev/null
+  fake_ps "$APP_ON_SE1"
+  export STUB_PROBE_FAIL=SE-1
+  expect "busy device comes back as it is" [ "$(OWNER=a sl acquire --purpose test)" = SE-1 ]
+  expect "not restarted" [ "$(calls_of 'shutdown SE-1')" = 0 ]
+  expect "lease kept" [ -f "$(lease SE-1)" ]
+}
+
+test_sticky_reuse_restarts_an_idle_device_only_under_the_boot_lock() {
+  sticky_pool
+  OWNER=a sl acquire --purpose test >/dev/null
+  export STUB_PROBE_FAIL=SE-1
+  hold_lock boot-capacity lifecycle
+  local rc=0
+  OWNER=a sl acquire --purpose test >/dev/null 2>"$WORK/err" || rc=$?
+  expect "queues behind the other boot" [ "$rc" = 3 ]
+  expect "not restarted without the lock" [ "$(calls_of 'shutdown SE-1')" = 0 ]
+  expect "lease kept" [ -f "$(lease SE-1)" ]
+}
+
+test_sticky_stale_own_lease_with_running_app_returns_same_device() {
+  sticky_pool
+  erase_pool
+  OWNER=a sl acquire --purpose test >/dev/null
+  age_lease SE-1
+  fake_ps "$APP_ON_SE1"
+  expect "own device, not a second one" [ "$(OWNER=a sl acquire --purpose test)" = SE-1 ]
+  expect "exactly one lease" [ "$(ls "$SIMLEASE_STATE_DIR/leases" | wc -l | tr -d ' ')" = 1 ]
+  expect "heartbeat refreshed" [ "$(heartbeat_of SE-1)" -gt 1 ]
+  expect "nothing else erased" [ "$(calls_of 'erase SE-2')" = 0 ]
+}
+
+test_erase_path_keeps_boot_marker_when_shutdown_fails() {
+  erase_pool
+  set_state SE-1 Booted
+  export STUB_SHUTDOWN_FAIL=1
+  expect "skips the device it could not shut down" [ "$(sl acquire --purpose test 2>"$WORK/err")" = SE-2 ]
+  expect "SE 1 not erased while booted" [ "$(calls_of 'erase SE-1')" = 0 ]
+  expect "boot marker left for gc" [ -f "$SIMLEASE_STATE_DIR/booted/SE-1" ]
+  expect "says so" grep -q 'could not shut down iPhone SE 1' "$WORK/err"
+}
+
+test_failed_boot_after_erase_forgets_the_last_owner() {
+  sticky_pool
+  erase_pool
+  set_prepare "$PREP_RECORDER"
+  edit_config '.pools.test.max_devices = 1'
+  OWNER=a sl acquire --purpose test >/dev/null
+  OWNER=a sl release SE-1
+  local rc=0
+  STUB_PROBE_FAIL=SE-1 OWNER=b sl acquire --purpose test >/dev/null 2>&1 || rc=$?
+  expect "b did not get the device" [ "$rc" = 3 ]
+  expect "last owner forgotten" [ ! -e "$SIMLEASE_STATE_DIR/last/SE-1" ]
+  expect "a gets it back" [ "$(OWNER=a sl acquire --purpose test 2>/dev/null)" = SE-1 ]
+  expect "erased for a, for b and again for a" [ "$(calls_of 'erase SE-1')" = 3 ]
+  expect "prepared each time" [ "$(wc -l < "$PREP_LOG" | tr -d ' ')" = 3 ]
+}
+
+start_acquire_with_slow_hook() {
+  erase_pool
+  set_prepare "sleep 3; echo late > '$WORK/late'"
+  SIMLEASE_SESSION=me "$BASH_BIN" "$ROOT/bin/simlease" acquire --purpose test >/dev/null 2>&1 &
+  ACQUIRE_PID=$!
+  local tries=0
+  until grep -qx 'simctl erase SE-1' "$STUB_DIR/calls.log" || (( tries >= 50 )); do
+    sleep 0.1
+    tries=$(( tries + 1 ))
+  done
+  sleep 0.5
+}
+
+test_prepare_hook_stops_when_simlease_is_killed() {
+  start_acquire_with_slow_hook
+  kill -KILL "$ACQUIRE_PID"
+  wait "$ACQUIRE_PID" 2>/dev/null || true
+  sleep 4
+  expect "the hook did not outlive simlease" [ ! -e "$WORK/late" ]
+}
+
+test_prepare_hook_stops_on_hangup() {
+  start_acquire_with_slow_hook
+  kill -HUP "$ACQUIRE_PID"
+  local rc=0
+  wait "$ACQUIRE_PID" 2>/dev/null || rc=$?
+  sleep 4
+  expect "exit 129" [ "$rc" = 129 ]
+  expect "the hook stopped" [ ! -e "$WORK/late" ]
+  expect "no locks left behind" [ -z "$(ls "$SIMLEASE_STATE_DIR/locks")" ]
 }
 
 install_copy() {
